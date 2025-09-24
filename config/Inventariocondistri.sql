@@ -17,7 +17,7 @@
 
 -- Volcando estructura de base de datos para inventario_system
 CREATE DATABASE IF NOT EXISTS `Inventariocondistri` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */;
-USE `inventario_system`;
+USE `Inventariocondistri`;
 
 -- Volcando estructura para tabla inventario_system.detalle_ingresos
 CREATE TABLE IF NOT EXISTS `detalle_ingresos` (

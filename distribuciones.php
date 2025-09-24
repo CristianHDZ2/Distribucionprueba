@@ -4,72 +4,59 @@ require_once 'config/database.php';
 $database = new Database();
 $db = $database->getConnection();
 
+// Variables para mensajes
 $mensaje = '';
 $tipo_mensaje = '';
 
-// Procesar acciones
+// Procesar formularios
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     if (isset($_POST['accion'])) {
         switch ($_POST['accion']) {
-            case 'crear_distribucion':
+            case 'generar_distribucion':
                 try {
                     $db->beginTransaction();
                     
                     $fecha_inicio = $_POST['fecha_inicio'];
                     $fecha_fin = $_POST['fecha_fin'];
-                    $dias_exclusion = isset($_POST['dias_exclusion']) ? json_encode($_POST['dias_exclusion']) : '[]';
+                    $dias_exclusion = json_encode($_POST['dias_exclusion'] ?? []);
                     $tipo_distribucion = $_POST['tipo_distribucion'];
                     $productos_seleccionados = '';
                     
-                    // Si es distribución parcial, obtener productos seleccionados
-                    if ($tipo_distribucion == 'parcial') {
-                        $productos_data = [];
-                        $productos_ids = $_POST['productos_parciales'];
-                        $cantidades_parciales = $_POST['cantidades_parciales'];
-                        
-                        for ($i = 0; $i < count($productos_ids); $i++) {
-                            if ($cantidades_parciales[$i] > 0) {
-                                $productos_data[] = [
-                                    'producto_id' => $productos_ids[$i],
-                                    'cantidad' => $cantidades_parciales[$i]
+                    if ($tipo_distribucion == 'parcial' && isset($_POST['productos_seleccionados'])) {
+                        $productos_parciales = [];
+                        foreach ($_POST['productos_seleccionados'] as $producto_id) {
+                            $cantidad = (int)($_POST['cantidades'][$producto_id] ?? 0);
+                            if ($cantidad > 0) {
+                                $productos_parciales[] = [
+                                    'producto_id' => $producto_id,
+                                    'cantidad' => $cantidad
                                 ];
                             }
                         }
-                        $productos_seleccionados = json_encode($productos_data);
+                        $productos_seleccionados = json_encode($productos_parciales);
                     }
                     
-                    // VALIDACIÓN PREVIA CORREGIDA
-                    $validacion = validarDistribucionFactible($db, $fecha_inicio, $fecha_fin, $dias_exclusion, $tipo_distribucion, $productos_seleccionados);
-                    
-                    if (!$validacion['factible']) {
-                        $db->rollBack();
-                        $mensaje = $validacion['mensaje'];
-                        $tipo_mensaje = "warning";
-                        break;
-                    }
-                    
-                    // Insertar la distribución
-                    $stmt = $db->prepare("INSERT INTO distribuciones (fecha_inicio, fecha_fin, dias_exclusion, tipo_distribucion, productos_seleccionados) VALUES (?, ?, ?, ?, ?)");
+                    // Crear distribución
+                    $stmt = $db->prepare("INSERT INTO distribuciones (fecha_inicio, fecha_fin, dias_exclusion, tipo_distribucion, productos_seleccionados, estado, fecha_creacion) VALUES (?, ?, ?, ?, ?, 'activo', NOW())");
                     $stmt->execute([$fecha_inicio, $fecha_fin, $dias_exclusion, $tipo_distribucion, $productos_seleccionados]);
-                    
                     $distribucion_id = $db->lastInsertId();
                     
-                    // Generar las tablas de distribución con el ALGORITMO CORREGIDO
+                    // Generar tablas
                     $resultado = generarTablasDistribucionCorregido($db, $distribucion_id, $fecha_inicio, $fecha_fin, $dias_exclusion, $tipo_distribucion, $productos_seleccionados);
                     
                     if ($resultado['success']) {
                         $db->commit();
-                        $mensaje = "Distribución creada exitosamente. " . $resultado['message'];
+                        $mensaje = "✅ Distribución generada exitosamente!\n\n" . $resultado['message'];
                         $tipo_mensaje = "success";
                     } else {
                         $db->rollBack();
-                        $mensaje = "Error al generar la distribución: " . $resultado['message'];
+                        $mensaje = "❌ Error: " . $resultado['message'];
                         $tipo_mensaje = "danger";
                     }
                     
                 } catch (Exception $e) {
                     $db->rollBack();
-                    $mensaje = "Error al crear la distribución: " . $e->getMessage();
+                    $mensaje = "Error al generar distribución: " . $e->getMessage();
                     $tipo_mensaje = "danger";
                 }
                 break;
@@ -78,12 +65,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 try {
                     $db->beginTransaction();
                     
-                    // Revertir existencias antes de eliminar
+                    $distribucion_id = $_POST['distribucion_id'];
+                    
+                    // Obtener todas las tablas de la distribución
                     $stmt_tablas = $db->prepare("SELECT id FROM tablas_distribucion WHERE distribucion_id = ? AND estado = 'activo'");
-                    $stmt_tablas->execute([$_POST['distribucion_id']]);
+                    $stmt_tablas->execute([$distribucion_id]);
                     $tablas = $stmt_tablas->fetchAll();
                     
                     foreach ($tablas as $tabla) {
+                        // Revertir existencias
                         $stmt_detalles = $db->prepare("SELECT producto_id, cantidad FROM detalle_tablas_distribucion WHERE tabla_id = ?");
                         $stmt_detalles->execute([$tabla['id']]);
                         $detalles = $stmt_detalles->fetchAll();
@@ -92,22 +82,27 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $stmt_revertir = $db->prepare("UPDATE productos SET existencia = existencia + ? WHERE id = ?");
                             $stmt_revertir->execute([$detalle['cantidad'], $detalle['producto_id']]);
                         }
+                        
+                        // Eliminar detalles
+                        $stmt_eliminar_detalles = $db->prepare("DELETE FROM detalle_tablas_distribucion WHERE tabla_id = ?");
+                        $stmt_eliminar_detalles->execute([$tabla['id']]);
                     }
                     
-                    // Marcar distribución como eliminada
-                    $stmt_eliminar = $db->prepare("UPDATE distribuciones SET estado = 'eliminado' WHERE id = ?");
-                    $stmt_eliminar->execute([$_POST['distribucion_id']]);
-                    
+                    // Marcar tablas como eliminadas
                     $stmt_eliminar_tablas = $db->prepare("UPDATE tablas_distribucion SET estado = 'eliminado' WHERE distribucion_id = ?");
-                    $stmt_eliminar_tablas->execute([$_POST['distribucion_id']]);
+                    $stmt_eliminar_tablas->execute([$distribucion_id]);
+                    
+                    // Marcar distribución como eliminada
+                    $stmt_eliminar_distribucion = $db->prepare("UPDATE distribuciones SET estado = 'eliminado' WHERE id = ?");
+                    $stmt_eliminar_distribucion->execute([$distribucion_id]);
                     
                     $db->commit();
-                    $mensaje = "Distribución eliminada exitosamente.";
+                    $mensaje = "Distribución eliminada y existencias revertidas exitosamente.";
                     $tipo_mensaje = "success";
                     
                 } catch (Exception $e) {
                     $db->rollBack();
-                    $mensaje = "Error al eliminar la distribución: " . $e->getMessage();
+                    $mensaje = "Error al eliminar distribución: " . $e->getMessage();
                     $tipo_mensaje = "danger";
                 }
                 break;
@@ -115,132 +110,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     }
 }
 
-// **FUNCIÓN DE VALIDACIÓN CORREGIDA - BASADA EN UNIDADES TOTALES**
-function validarDistribucionFactible($db, $fecha_inicio, $fecha_fin, $dias_exclusion_json, $tipo_distribucion, $productos_seleccionados_json) {
-    try {
-        $dias_exclusion = json_decode($dias_exclusion_json, true) ?: [];
-        
-        // Calcular días válidos disponibles
-        $fechas_validas = calcularFechasValidas($fecha_inicio, $fecha_fin, $dias_exclusion);
-        $total_dias_disponibles = count($fechas_validas);
-        
-        if ($total_dias_disponibles <= 0) {
-            return [
-                'factible' => false,
-                'mensaje' => "❌ No hay días válidos para la distribución. Verifique las fechas y días de exclusión seleccionados."
-            ];
-        }
-        
-        // Obtener información de unidades disponibles
-        $unidades_info = obtenerUnidadesParaDistribucion($db, $tipo_distribucion, $productos_seleccionados_json);
-        
-        if ($unidades_info['total_unidades'] <= 0) {
-            return [
-                'factible' => false,
-                'mensaje' => "❌ No hay unidades disponibles para distribuir. Verifique el inventario."
-            ];
-        }
-        
-        $total_unidades_disponibles = $unidades_info['total_unidades'];
-        $total_productos_unicos = $unidades_info['total_productos'];
-        
-        // **CÁLCULOS CORREGIDOS BASADOS EN UNIDADES**
-        $minimo_tablas_por_dia = 10;
-        $maximo_tablas_por_dia = 40;
-        
-        // Calcular unidades por día disponibles
-        $unidades_por_dia = floor($total_unidades_disponibles / $total_dias_disponibles);
-        
-        // Verificar si hay al menos 1 unidad por día
-        if ($unidades_por_dia < 1) {
-            return [
-                'factible' => false,
-                'mensaje' => sprintf(
-                    "❌ INVENTARIO INSUFICIENTE:\n\n" .
-                    "📊 Análisis de unidades:\n" .
-                    "• Días disponibles: %d días\n" .
-                    "• Unidades totales disponibles: %s\n" .
-                    "• Promedio por día posible: %.2f unidades\n\n" .
-                    "⚠️ No hay suficientes unidades para cubrir ni siquiera 1 unidad por día.\n\n" .
-                    "💡 Soluciones:\n" .
-                    "• Agregue más unidades al inventario\n" .
-                    "• Reduzca el período de distribución\n" .
-                    "• Excluya más días de la semana",
-                    $total_dias_disponibles,
-                    number_format($total_unidades_disponibles),
-                    $total_unidades_disponibles / $total_dias_disponibles
-                )
-            ];
-        }
-        
-        // Calcular cuántas tablas se pueden generar por día
-        $tablas_posibles_por_dia = min($maximo_tablas_por_dia, max(1, floor($unidades_por_dia / 1))); // Mínimo 1 unidad por tabla
-        
-        // Verificar si se puede cumplir el objetivo de 10 tablas por día
-        if ($tablas_posibles_por_dia < $minimo_tablas_por_dia) {
-            // Puede distribuir pero con menos de 10 tablas por día
-            return [
-                'factible' => true,
-                'mensaje' => sprintf(
-                    "⚠️ DISTRIBUCIÓN LIMITADA - COBERTURA REDUCIDA:\n\n" .
-                    "📊 Análisis de capacidad:\n" .
-                    "• Días disponibles: %d días\n" .
-                    "• Unidades totales: %s\n" .
-                    "• Unidades por día: %d\n" .
-                    "• Tablas posibles por día: %d (menos de las 10 ideales)\n\n" .
-                    "✅ DISTRIBUCIÓN FACTIBLE:\n" .
-                    "• Se cubrirán TODOS los %d días\n" .
-                    "• Cada día tendrá %d tabla(s) con productos\n" .
-                    "• Cobertura garantizada del 100%% de los días\n\n" .
-                    "💡 Para obtener 10+ tablas por día necesitaría %d unidades adicionales.",
-                    $total_dias_disponibles,
-                    number_format($total_unidades_disponibles),
-                    $unidades_por_dia,
-                    $tablas_posibles_por_dia,
-                    $total_dias_disponibles,
-                    $tablas_posibles_por_dia,
-                    ($minimo_tablas_por_dia * $total_dias_disponibles) - $total_unidades_disponibles
-                )
-            ];
-        }
-        
-        // Distribución óptima factible
-        return [
-            'factible' => true,
-            'mensaje' => sprintf(
-                "✅ DISTRIBUCIÓN ÓPTIMA FACTIBLE:\n\n" .
-                "📊 Análisis exitoso:\n" .
-                "• %d días disponibles para distribución\n" .
-                "• %s unidades totales a distribuir\n" .
-                "• %d productos únicos disponibles\n" .
-                "• Promedio: %d unidades por día\n" .
-                "• Estimado: %d tablas por día\n\n" .
-                "🎯 El sistema garantiza:\n" .
-                "• Mínimo %d tabla(s) por día\n" .
-                "• Máximo %d tablas por día\n" .
-                "• Cobertura del 100%% de los días seleccionados\n" .
-                "• Distribución equilibrada de %d unidades totales",
-                $total_dias_disponibles,
-                number_format($total_unidades_disponibles),
-                $total_productos_unicos,
-                $unidades_por_dia,
-                min($maximo_tablas_por_dia, max($minimo_tablas_por_dia, $tablas_posibles_por_dia)),
-                max(1, $tablas_posibles_por_dia),
-                $maximo_tablas_por_dia,
-                $total_unidades_disponibles
-            ),
-            'dias_disponibles' => $total_dias_disponibles,
-            'unidades_disponibles' => $total_unidades_disponibles,
-            'productos_unicos' => $total_productos_unicos
-        ];
-        
-    } catch (Exception $e) {
-        return [
-            'factible' => false,
-            'mensaje' => "Error al validar la distribución: " . $e->getMessage()
-        ];
-    }
-}
 // **FUNCIÓN PARA CALCULAR FECHAS VÁLIDAS**
 function calcularFechasValidas($fecha_inicio, $fecha_fin, $dias_exclusion) {
     $fechas_validas = [];
@@ -378,233 +247,156 @@ function generarTablasDistribucionCorregido($db, $distribucion_id, $fecha_inicio
             if (empty($productos_disponibles_hoy)) {
                 // Si ya no hay productos, crear tabla vacía simbólica
                 $stmt_tabla = $db->prepare("INSERT INTO tablas_distribucion (distribucion_id, fecha_tabla, numero_tabla, total_tabla) VALUES (?, ?, ?, ?)");
-                $stmt_tabla->execute([$distribucion_id, $fecha, 1, 0]);
+                $stmt_tabla->execute([$distribucion_id, $fecha, 1, 0.00]);
                 
                 $estadisticas_detalladas[] = [
                     'fecha' => $fecha,
                     'dia' => $dia_nombre,
-                    'tablas_generadas' => 1,
+                    'tablas_creadas' => 1,
                     'unidades_distribuidas' => 0,
-                    'total_dia' => 0,
-                    'nota' => 'Sin unidades disponibles'
+                    'estado' => 'Sin productos disponibles'
                 ];
                 continue;
             }
             
             $unidades_objetivo_dia = $plan_dia['unidades_objetivo'];
-            $tablas_planificadas_dia = $plan_dia['tablas_planificadas'];
-            
-            // **ALGORITMO DE DISTRIBUCIÓN DE UNIDADES DEL DÍA**
-            $tablas_generadas_hoy = 0;
+            $tablas_objetivo_dia = $plan_dia['tablas_planificadas'];
             $unidades_distribuidas_hoy = 0;
-            $total_dia = 0;
+            $tablas_creadas_hoy = 0;
             
-            // Distribuir las unidades objetivo entre las tablas planificadas
-            for ($tabla_num = 1; $tabla_num <= $tablas_planificadas_dia && $unidades_distribuidas_hoy < $unidades_objetivo_dia; $tabla_num++) {
-                // Recalcular productos disponibles para esta tabla
-                $productos_para_tabla = array_filter($productos_a_distribuir, function($p) {
-                    return $p['cantidad_restante'] > 0;
-                });
-                
-                if (empty($productos_para_tabla)) {
-                    break; // No hay más productos
-                }
-                
-                // Insertar tabla
-                $stmt_tabla = $db->prepare("INSERT INTO tablas_distribucion (distribucion_id, fecha_tabla, numero_tabla) VALUES (?, ?, ?)");
-                $stmt_tabla->execute([$distribucion_id, $fecha, $tabla_num]);
+            // **GENERAR TABLAS PARA ESTE DÍA**
+            for ($tabla_num = 1; $tabla_num <= $tablas_objetivo_dia; $tabla_num++) {
+                // Crear tabla
+                $stmt_tabla = $db->prepare("INSERT INTO tablas_distribucion (distribucion_id, fecha_tabla, numero_tabla, total_tabla) VALUES (?, ?, ?, ?)");
+                $stmt_tabla->execute([$distribucion_id, $fecha, $tabla_num, 0.00]);
                 $tabla_id = $db->lastInsertId();
                 
-                // **SELECCIÓN Y DISTRIBUCIÓN DE UNIDADES EN LA TABLA**
-                $total_tabla = 0;
-                $unidades_restantes_dia = $unidades_objetivo_dia - $unidades_distribuidas_hoy;
-                $tablas_restantes_dia = $tablas_planificadas_dia - $tabla_num + 1;
+                $total_tabla_actual = 0;
+                $productos_en_tabla = 0;
                 
-                // Calcular cuántas unidades asignar a esta tabla
-                $unidades_para_esta_tabla = max(1, floor($unidades_restantes_dia / $tablas_restantes_dia));
-                
-                // Distribuir estas unidades entre productos disponibles
-                $unidades_asignadas_tabla = 0;
-                $productos_usados_en_tabla = [];
-                
-                // Aleatorizar productos para variedad
-                $indices_productos = array_keys($productos_para_tabla);
-                shuffle($indices_productos);
-                
-                foreach ($indices_productos as $indice) {
-                    if ($unidades_asignadas_tabla >= $unidades_para_esta_tabla) {
-                        break; // Ya asignamos todas las unidades de esta tabla
+                // **DISTRIBUIR PRODUCTOS EN ESTA TABLA**
+                foreach ($productos_disponibles_hoy as $indice => $producto) {
+                    if ($producto['cantidad_restante'] <= 0) continue;
+                    
+                    // Calcular cuánto asignar (al menos 1, máximo lo disponible)
+                    $cantidad_a_asignar = max(1, min($producto['cantidad_restante'], 
+                        ceil($unidades_objetivo_dia / $tablas_objetivo_dia)));
+                    
+                    if ($unidades_distribuidas_hoy + $cantidad_a_asignar > $unidades_objetivo_dia) {
+                        $cantidad_a_asignar = max(0, $unidades_objetivo_dia - $unidades_distribuidas_hoy);
                     }
                     
-                    if ($productos_a_distribuir[$indice]['cantidad_restante'] <= 0) {
-                        continue; // Este producto ya se agotó
-                    }
-                    
-                    // Determinar cuántas unidades usar de este producto
-                    $unidades_restantes_tabla = $unidades_para_esta_tabla - $unidades_asignadas_tabla;
-                    $cantidad_disponible_producto = $productos_a_distribuir[$indice]['cantidad_restante'];
-                    
-                    // Usar entre 1 y las unidades disponibles, pero no más de las que faltan para la tabla
-                    $cantidad_usar = min(
-                        $cantidad_disponible_producto,
-                        $unidades_restantes_tabla,
-                        max(1, rand(1, min(5, $unidades_restantes_tabla))) // Variar entre 1 y 5 unidades
-                    );
-                    
-                    if ($cantidad_usar > 0) {
-                        $precio = $productos_a_distribuir[$indice]['precio_venta'];
-                        $subtotal = $cantidad_usar * $precio;
-                        $total_tabla += $subtotal;
+                    if ($cantidad_a_asignar > 0) {
+                        $subtotal = $cantidad_a_asignar * $producto['precio_venta'];
                         
-                        // Insertar detalle en BD
+                        // Insertar detalle
                         $stmt_detalle = $db->prepare("INSERT INTO detalle_tablas_distribucion (tabla_id, producto_id, cantidad, precio_venta, subtotal) VALUES (?, ?, ?, ?, ?)");
-                        $stmt_detalle->execute([$tabla_id, $productos_a_distribuir[$indice]['id'], $cantidad_usar, $precio, $subtotal]);
+                        $stmt_detalle->execute([$tabla_id, $producto['id'], $cantidad_a_asignar, $producto['precio_venta'], $subtotal]);
                         
-                        // Actualizar existencia en BD
+                        // Actualizar existencia en productos
                         $stmt_update = $db->prepare("UPDATE productos SET existencia = existencia - ? WHERE id = ?");
-                        $stmt_update->execute([$cantidad_usar, $productos_a_distribuir[$indice]['id']]);
+                        $stmt_update->execute([$cantidad_a_asignar, $producto['id']]);
                         
-                        // Actualizar cantidad restante en nuestro array
-                        $productos_a_distribuir[$indice]['cantidad_restante'] -= $cantidad_usar;
-                        $unidades_asignadas_tabla += $cantidad_usar;
-                        $unidades_distribuidas_hoy += $cantidad_usar;
-                        $total_unidades_distribuidas += $cantidad_usar;
+                        // Actualizar arrays de control
+                        $productos_a_distribuir[$indice]['cantidad_restante'] -= $cantidad_a_asignar;
+                        $productos_disponibles_hoy[$indice]['cantidad_restante'] -= $cantidad_a_asignar;
                         
-                        // Verificar si el producto se agotó
+                        $total_tabla_actual += $subtotal;
+                        $unidades_distribuidas_hoy += $cantidad_a_asignar;
+                        $productos_en_tabla++;
+                        
                         if ($productos_a_distribuir[$indice]['cantidad_restante'] <= 0) {
                             $productos_agotados_completamente++;
                         }
-                        
-                        $productos_usados_en_tabla[] = $productos_a_distribuir[$indice]['id'];
                     }
                     
-                    // Limitar productos por tabla para mejor distribución
-                    if (count($productos_usados_en_tabla) >= 3) {
+                    // Si ya alcanzamos el objetivo del día, salir
+                    if ($unidades_distribuidas_hoy >= $unidades_objetivo_dia) {
                         break;
                     }
                 }
                 
                 // Actualizar total de la tabla
-                $stmt_total = $db->prepare("UPDATE tablas_distribucion SET total_tabla = ? WHERE id = ?");
-                $stmt_total->execute([$total_tabla, $tabla_id]);
+                $stmt_update_tabla = $db->prepare("UPDATE tablas_distribucion SET total_tabla = ? WHERE id = ?");
+                $stmt_update_tabla->execute([$total_tabla_actual, $tabla_id]);
                 
-                $total_dia += $total_tabla;
-                $tablas_generadas_hoy++;
+                $tablas_creadas_hoy++;
                 $total_tablas_generadas++;
+                
+                // Si ya no hay más productos o alcanzamos el objetivo, salir del bucle
+                if ($unidades_distribuidas_hoy >= $unidades_objetivo_dia || empty(array_filter($productos_disponibles_hoy, function($p) { return $p['cantidad_restante'] > 0; }))) {
+                    break;
+                }
             }
+            
+            $total_unidades_distribuidas += $unidades_distribuidas_hoy;
             
             $estadisticas_detalladas[] = [
                 'fecha' => $fecha,
                 'dia' => $dia_nombre,
-                'tablas_generadas' => $tablas_generadas_hoy,
+                'tablas_creadas' => $tablas_creadas_hoy,
                 'unidades_distribuidas' => $unidades_distribuidas_hoy,
-                'total_dia' => $total_dia,
-                'nota' => $unidades_distribuidas_hoy >= $plan_dia['unidades_objetivo'] ? 'Objetivo cumplido' : 'Distribución ajustada'
+                'estado' => 'Completado exitosamente'
             ];
         }
         
-        // **PASO 4: DISTRIBUCIÓN DE REMANENTES**
-        $unidades_remanentes = array_sum(array_column($productos_a_distribuir, 'cantidad_restante'));
+        // **PASO 4: DISTRIBUIR REMANENTES SI EXISTEN**
+        $productos_con_remanentes = array_filter($productos_a_distribuir, function($p) {
+            return $p['cantidad_restante'] > 0;
+        });
+        
         $mensaje_remanentes = '';
-        
-        if ($unidades_remanentes > 0) {
-            $mensaje_remanentes = distribuirRemanentesPorUnidades($db, $distribucion_id, $productos_a_distribuir, $fechas_validas);
-            // Actualizar estadística
-            foreach ($productos_a_distribuir as $producto) {
-                if ($producto['cantidad_restante'] <= 0) {
-                    $productos_agotados_completamente++;
-                }
-            }
+        if (!empty($productos_con_remanentes)) {
+            $mensaje_remanentes = distribuirRemanentes($db, $distribucion_id, $productos_con_remanentes);
         }
         
-        // **PASO 5: GENERAR MENSAJE DE RESULTADO**
-        $porcentaje_distribucion = ($total_unidades_distribuidas / $total_unidades_disponibles) * 100;
-        $promedio_tablas_por_dia = $total_tablas_generadas / $total_dias;
-        $promedio_unidades_por_dia = $total_unidades_distribuidas / $total_dias;
-        
-        $mensaje = sprintf(
-            "✅ DISTRIBUCIÓN COMPLETADA - ALGORITMO V3.0 CORREGIDO:\n\n" .
-            "📊 ESTADÍSTICAS DE UNIDADES:\n" .
-            "• %s unidades distribuidas de %s disponibles (%.1f%%)\n" .
-            "• Promedio: %.1f unidades por día\n" .
-            "• %d tablas generadas en %d días (%.1f tablas/día)\n\n" .
-            "🎯 COBERTURA GARANTIZADA:\n" .
-            "• %d/%d días cubiertos (100%% de cobertura)\n" .
-            "• Todos los días tienen tablas con productos\n" .
-            "• %d productos únicos agotados completamente\n\n" .
-            "📈 DISTRIBUCIÓN DETALLADA:",
-            number_format($total_unidades_distribuidas),
-            number_format($total_unidades_disponibles),
-            $porcentaje_distribucion,
-            $promedio_unidades_por_dia,
-            $total_tablas_generadas,
-            $total_dias,
-            $promedio_tablas_por_dia,
-            $total_dias,
-            $total_dias,
-            $productos_agotados_completamente
-        );
-        
-        // Agregar detalles de algunos días
-        $mensaje .= "\n";
-        $counter = 0;
-        foreach ($estadisticas_detalladas as $stat) {
-            if ($counter < 5) {
-                $mensaje .= sprintf(
-                    "• %s %s: %d tablas, %d unidades, $%.2f (%s)\n",
-                    $stat['dia'],
-                    date('d/m', strtotime($stat['fecha'])),
-                    $stat['tablas_generadas'],
-                    $stat['unidades_distribuidas'],
-                    $stat['total_dia'],
-                    $stat['nota']
-                );
-                $counter++;
-            }
-        }
-        
-        if ($total_dias > 5) {
-            $mensaje .= "• ... y " . ($total_dias - 5) . " días más\n";
-        }
+        // **GENERAR MENSAJE DE ÉXITO DETALLADO**
+        $resumen_estadisticas = "\n🎯 DISTRIBUCIÓN COMPLETADA:\n";
+        $resumen_estadisticas .= "• {$total_tablas_generadas} tablas generadas en {$total_dias} días\n";
+        $resumen_estadisticas .= "• {$total_unidades_distribuidas} unidades distribuidas de {$total_unidades_disponibles}\n";
+        $resumen_estadisticas .= "• {$productos_agotados_completamente} productos agotados completamente\n";
+        $resumen_estadisticas .= "• Promedio: " . round($total_tablas_generadas / $total_dias, 1) . " tablas por día\n";
         
         if (!empty($mensaje_remanentes)) {
-            $mensaje .= "\n" . $mensaje_remanentes;
+            $resumen_estadisticas .= "\n" . $mensaje_remanentes;
         }
         
-        $mensaje .= "\n\n🏆 ¡DISTRIBUCIÓN PERFECTA! Cobertura del 100% de los días con distribución equilibrada de unidades.";
+        $resumen_estadisticas .= "\n📊 DETALLE POR DÍA:\n";
+        foreach ($estadisticas_detalladas as $stat) {
+            $resumen_estadisticas .= "• {$stat['fecha']} ({$stat['dia']}): {$stat['tablas_creadas']} tablas, {$stat['unidades_distribuidas']} unidades\n";
+        }
         
-        return ['success' => true, 'message' => $mensaje];
+        return [
+            'success' => true,
+            'message' => $resumen_estadisticas,
+            'estadisticas' => [
+                'total_tablas' => $total_tablas_generadas,
+                'total_unidades_distribuidas' => $total_unidades_distribuidas,
+                'productos_agotados' => $productos_agotados_completamente,
+                'detalle_por_dia' => $estadisticas_detalladas
+            ]
+        ];
         
     } catch (Exception $e) {
-        return ['success' => false, 'message' => $e->getMessage()];
+        return [
+            'success' => false,
+            'message' => 'Error en la generación: ' . $e->getMessage()
+        ];
     }
 }
 
-// **FUNCIÓN CORREGIDA PARA DISTRIBUIR REMANENTES POR UNIDADES**
-function distribuirRemanentesPorUnidades($db, $distribucion_id, $productos_remanentes, $fechas_validas) {
-    $total_unidades_remanentes = array_sum(array_column($productos_remanentes, 'cantidad_restante'));
-    
-    if ($total_unidades_remanentes == 0) {
-        return "✅ Sin remanentes - distribución 100% completa";
-    }
-    
-    // Obtener tablas existentes para agregar remanentes
-    $stmt_tablas = $db->prepare("
-        SELECT td.id, td.fecha_tabla, td.numero_tabla, td.total_tabla,
-               COUNT(dtd.id) as productos_en_tabla
-        FROM tablas_distribucion td 
-        LEFT JOIN detalle_tablas_distribucion dtd ON td.id = dtd.tabla_id
-        WHERE td.distribucion_id = ? 
-        GROUP BY td.id
-        ORDER BY td.fecha_tabla ASC, td.numero_tabla ASC
-    ");
+// **FUNCIÓN PARA DISTRIBUIR REMANENTES**
+function distribuirRemanentes($db, $distribucion_id, $productos_remanentes) {
+    // Obtener todas las tablas existentes de la distribución
+    $stmt_tablas = $db->prepare("SELECT id, total_tabla FROM tablas_distribucion WHERE distribucion_id = ? AND estado = 'activo' ORDER BY fecha_tabla, numero_tabla");
     $stmt_tablas->execute([$distribucion_id]);
     $tablas_disponibles = $stmt_tablas->fetchAll();
     
     if (empty($tablas_disponibles)) {
-        return "⚠️ Quedan {$total_unidades_remanentes} unidades sin distribuir (sin tablas disponibles)";
+        return "⚠️ No hay tablas disponibles para distribuir remanentes";
     }
     
+    $total_unidades_remanentes = array_sum(array_column($productos_remanentes, 'cantidad_restante'));
     $unidades_distribuidas = 0;
     $tabla_index = 0;
     
@@ -615,37 +407,31 @@ function distribuirRemanentesPorUnidades($db, $distribucion_id, $productos_reman
         while ($cantidad_restante > 0 && $tabla_index < count($tablas_disponibles)) {
             $tabla = $tablas_disponibles[$tabla_index];
             
-            // Verificar que el producto no esté ya en esta tabla
-            $stmt_check = $db->prepare("SELECT id FROM detalle_tablas_distribucion WHERE tabla_id = ? AND producto_id = ?");
-            $stmt_check->execute([$tabla['id'], $producto['id']]);
+            // Decidir cuánto agregar a esta tabla (máximo 3 unidades por vuelta)
+            $cantidad_agregar = min(3, $cantidad_restante);
             
-            if (!$stmt_check->fetch()) {
-                // Producto no está en esta tabla, agregarlo
-                $cantidad_agregar = min($cantidad_restante, rand(1, max(1, floor($cantidad_restante / 3))));
+            if ($cantidad_agregar > 0) {
+                $subtotal = $cantidad_agregar * $producto['precio_venta'];
                 
-                if ($cantidad_agregar > 0) {
-                    $subtotal = $cantidad_agregar * $producto['precio_venta'];
-                    
-                    // Insertar detalle del remanente
-                    $stmt_detalle = $db->prepare("INSERT INTO detalle_tablas_distribucion (tabla_id, producto_id, cantidad, precio_venta, subtotal) VALUES (?, ?, ?, ?, ?)");
-                    $stmt_detalle->execute([$tabla['id'], $producto['id'], $cantidad_agregar, $producto['precio_venta'], $subtotal]);
-                    
-                    // Actualizar existencia
-                    $stmt_update = $db->prepare("UPDATE productos SET existencia = existencia - ? WHERE id = ?");
-                    $stmt_update->execute([$cantidad_agregar, $producto['id']]);
-                    
-                    // Actualizar total de la tabla
-                    $nuevo_total = $tabla['total_tabla'] + $subtotal;
-                    $stmt_total = $db->prepare("UPDATE tablas_distribucion SET total_tabla = ? WHERE id = ?");
-                    $stmt_total->execute([$nuevo_total, $tabla['id']]);
-                    
-                    $cantidad_restante -= $cantidad_agregar;
-                    $unidades_distribuidas += $cantidad_agregar;
-                    $tabla['total_tabla'] = $nuevo_total;
-                    
-                    // Actualizar el producto en nuestro array
-                    $productos_remanentes[$indice]['cantidad_restante'] = $cantidad_restante;
-                }
+                // Insertar el detalle adicional
+                $stmt_detalle = $db->prepare("INSERT INTO detalle_tablas_distribucion (tabla_id, producto_id, cantidad, precio_venta, subtotal) VALUES (?, ?, ?, ?, ?)");
+                $stmt_detalle->execute([$tabla['id'], $producto['id'], $cantidad_agregar, $producto['precio_venta'], $subtotal]);
+                
+                // Actualizar existencia
+                $stmt_update = $db->prepare("UPDATE productos SET existencia = existencia - ? WHERE id = ?");
+                $stmt_update->execute([$cantidad_agregar, $producto['id']]);
+                
+                // Actualizar total de la tabla
+                $nuevo_total = $tabla['total_tabla'] + $subtotal;
+                $stmt_total = $db->prepare("UPDATE tablas_distribucion SET total_tabla = ? WHERE id = ?");
+                $stmt_total->execute([$nuevo_total, $tabla['id']]);
+                
+                $cantidad_restante -= $cantidad_agregar;
+                $unidades_distribuidas += $cantidad_agregar;
+                $tabla['total_tabla'] = $nuevo_total;
+                
+                // Actualizar el producto en nuestro array
+                $productos_remanentes[$indice]['cantidad_restante'] = $cantidad_restante;
             }
             
             $tabla_index++;
@@ -669,7 +455,6 @@ function distribuirRemanentesPorUnidades($db, $distribucion_id, $productos_reman
         return "⚠️ No se pudieron distribuir los {$total_unidades_remanentes} remanentes restantes";
     }
 }
-
 // Obtener distribuciones con paginación
 $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
 $limit = 10;
@@ -737,43 +522,326 @@ $productos_con_existencia = $stmt_productos->fetchAll();
             }
         }
         .distribution-card {
-            transition: transform 0.2s;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
         .distribution-card:hover {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
             transform: translateY(-2px);
+            transition: all 0.3s ease;
         }
-        .validacion-preview {
-            border: 2px solid;
+        .btn-group-sm > .btn, .btn-sm {
+            padding: .25rem .5rem;
+            font-size: .875rem;
+            border-radius: .2rem;
+        }
+        
+        /* **CORRECCIÓN PRINCIPAL: CSS PARA IMPRESIÓN** */
+        @media print {
+            /* Ocultar elementos no necesarios para impresión */
+            .sidebar, 
+            .no-print, 
+            .btn, 
+            .modal-header, 
+            .modal-footer,
+            .pagination,
+            .card-footer,
+            .alert,
+            nav {
+                display: none !important;
+            }
+            
+            /* Ajustar el contenido principal */
+            .main-content {
+                margin-left: 0 !important;
+                width: 100% !important;
+                padding: 0 !important;
+            }
+            
+            /* **Configurar el modal para impresión completa** */
+            .modal {
+                position: static !important;
+                display: block !important;
+                width: 100% !important;
+                height: auto !important;
+                overflow: visible !important;
+                background: white !important;
+            }
+            
+            .modal-dialog {
+                position: static !important;
+                width: 100% !important;
+                max-width: none !important;
+                margin: 0 !important;
+                transform: none !important;
+            }
+            
+            .modal-content {
+                position: static !important;
+                width: 100% !important;
+                border: none !important;
+                box-shadow: none !important;
+                background: white !important;
+            }
+            
+            .modal-body {
+                position: static !important;
+                max-height: none !important;
+                overflow: visible !important;
+                padding: 0 !important;
+                margin: 0 !important;
+            }
+            
+            /* **Estilos específicos para las tablas de distribución** */
+            .print-tabla-distribucion {
+                page-break-inside: avoid;
+                margin-bottom: 20px;
+                border: 1px solid #000;
+                padding: 10px;
+            }
+            
+            .print-dia-header {
+                background-color: #f8f9fa !important;
+                border-bottom: 2px solid #000;
+                padding: 10px;
+                margin-bottom: 15px;
+                font-weight: bold;
+                font-size: 16px;
+                page-break-after: avoid;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            .print-tabla-individual {
+                border: 1px solid #666;
+                margin-bottom: 15px;
+                page-break-inside: avoid;
+            }
+            
+            .print-tabla-header {
+                background-color: #e9ecef !important;
+                padding: 8px;
+                border-bottom: 1px solid #666;
+                font-weight: bold;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            .print-producto-row {
+                border-bottom: 1px solid #ccc;
+                padding: 5px 8px;
+            }
+            
+            .print-producto-row:last-child {
+                border-bottom: none;
+            }
+            
+            .print-total-tabla {
+                background-color: #f1f3f4 !important;
+                padding: 8px;
+                border-top: 2px solid #000;
+                font-weight: bold;
+                text-align: right;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            /* Ajustar tamaños de fuente para impresión */
+            body {
+                font-size: 12px !important;
+                line-height: 1.3 !important;
+            }
+            
+            h1, h2, h3, h4, h5, h6 {
+                margin-top: 0 !important;
+                margin-bottom: 10px !important;
+            }
+            
+            /* Configuración de página */
+            @page {
+                margin: 15mm;
+                size: A4;
+            }
+            
+            /* Forzar saltos de página apropiados */
+            .print-page-break {
+                page-break-before: always;
+            }
+            
+            /* Asegurar que las tablas no se corten */
+            .table {
+                page-break-inside: avoid;
+            }
+            
+            .table thead {
+                page-break-after: avoid;
+            }
+            
+            .table tbody tr {
+                page-break-inside: avoid;
+            }
+        }
+        
+        /* **Estilos para mejor visualización en pantalla** */
+        .tabla-dia-section {
+            margin-bottom: 2rem;
             border-radius: 8px;
-            padding: 15px;
-            margin: 15px 0;
-            background-color: #f8f9fa;
+            overflow: hidden;
         }
-        .validacion-preview.factible {
-            border-color: #28a745;
-            background-color: #d4edda;
+        
+        .tabla-dia-header {
+            background: linear-gradient(135deg, #007bff, #0056b3);
+            color: white;
+            padding: 1rem;
+            font-weight: bold;
+            font-size: 1.1rem;
         }
-        .validacion-preview.advertencia {
-            border-color: #ffc107;
-            background-color: #fff3cd;
-        }
-        .validacion-preview.no-factible {
-            border-color: #dc3545;
-            background-color: #f8d7da;
-        }
-        .producto-item {
-            border: 1px solid #dee2e6;
+        
+        .tabla-individual-card {
+            border: 1px solid #e0e0e0;
             border-radius: 6px;
-            padding: 10px;
-            margin-bottom: 8px;
-            background-color: #fefefe;
+            margin: 10px;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        .distribucion-estado {
-            font-size: 0.875rem;
+        
+        .tabla-header {
+            background: #f8f9fa;
+            padding: 12px;
+            border-bottom: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .tabla-numero {
+            font-weight: bold;
+            color: #495057;
+        }
+        
+        .tabla-total {
+            background: #28a745;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+        
+        .producto-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #f1f1f1;
+            display: grid;
+            grid-template-columns: 2fr 1fr 1fr;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .producto-item:last-child {
+            border-bottom: none;
+        }
+        
+        .producto-descripcion {
             font-weight: 500;
+            color: #495057;
         }
-        .table-sm td {
-            padding: 0.5rem 0.75rem;
+        
+        .producto-proveedor {
+            font-size: 0.85rem;
+            color: #6c757d;
+        }
+        
+        .producto-cantidad {
+            text-align: center;
+            font-weight: bold;
+            color: #007bff;
+        }
+        
+        .producto-precio {
+            text-align: right;
+            font-weight: 500;
+            color: #28a745;
+        }
+        
+        /* Responsividad */
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+            }
+            
+            .sidebar.show {
+                transform: translateX(0);
+            }
+            
+            .main-content {
+                margin-left: 0;
+                width: 100%;
+            }
+        }
+        
+        /* Estados de las distribuciones */
+        .estado-activo {
+            background-color: #d1e7dd;
+            color: #0f5132;
+        }
+        
+        .estado-eliminado {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        /* Animaciones suaves */
+        .card-hover {
+            transition: all 0.3s ease;
+        }
+        
+        .card-hover:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+        }
+        
+        /* Validación visual */
+        .is-invalid {
+            border-color: #dc3545;
+        }
+        
+        .is-valid {
+            border-color: #28a745;
+        }
+        
+        /* Spinner de carga */
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #007bff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Indicadores de progreso */
+        .progress-bar {
+            transition: width 0.6s ease;
+        }
+        
+        /* Tooltips personalizados */
+        .tooltip-inner {
+            background-color: #212529;
+            color: #fff;
+        }
+        
+        /* Badges mejorados */
+        .badge-custom {
+            font-size: 0.75rem;
+            padding: 0.35em 0.65em;
         }
     </style>
 </head>
@@ -783,12 +851,12 @@ $productos_con_existencia = $stmt_productos->fetchAll();
             <!-- Sidebar -->
             <nav class="col-md-3 col-lg-2 d-md-block sidebar collapse">
                 <div class="position-sticky pt-3">
-                    <div class="text-center mb-4">
-                        <h4 class="text-white">Inventario</h4>
-                    </div>
+                    <h6 class="sidebar-heading d-flex justify-content-between align-items-center px-3 mt-4 mb-1 text-muted">
+                        <span>SISTEMA DE INVENTARIO</span>
+                    </h6>
                     <ul class="nav flex-column">
                         <li class="nav-item">
-                            <a class="nav-link" href="index.php">
+                            <a class="nav-link" href="dashboard.php">
                                 <i class="bi bi-house-door"></i> Dashboard
                             </a>
                         </li>
@@ -798,364 +866,324 @@ $productos_con_existencia = $stmt_productos->fetchAll();
                             </a>
                         </li>
                         <li class="nav-item">
-                            <a class="nav-link" href="inventario.php">
-                                <i class="bi bi-clipboard-data"></i> Inventario
-                            </a>
-                        </li>
-                        <li class="nav-item">
                             <a class="nav-link" href="ingresos.php">
-                                <i class="bi bi-arrow-down-circle"></i> Ingresos
+                                <i class="bi bi-plus-circle"></i> Ingresos
                             </a>
                         </li>
                         <li class="nav-item">
                             <a class="nav-link active" href="distribuciones.php">
-                                <i class="bi bi-arrow-up-circle"></i> Distribuciones
+                                <i class="bi bi-truck"></i> Distribuciones
                             </a>
                         </li>
                         <li class="nav-item">
                             <a class="nav-link" href="reportes.php">
-                                <i class="bi bi-file-earmark-bar-graph"></i> Reportes
+                                <i class="bi bi-bar-chart"></i> Reportes
                             </a>
                         </li>
                     </ul>
                 </div>
             </nav>
 
-            <!-- Main content -->
+            <!-- Contenido principal -->
             <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
                 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                    <h1 class="h2">
-                        <i class="bi bi-arrow-up-circle text-primary"></i> Gestión de Distribuciones
-                    </h1>
-                    <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalDistribucion">
-                        <i class="bi bi-plus-lg"></i> Nueva Distribución
-                    </button>
+                    <h1 class="h2"><i class="bi bi-truck"></i> Gestión de Distribuciones</h1>
+                    <div class="btn-toolbar mb-2 mb-md-0 no-print">
+                        <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNuevaDistribucion">
+                            <i class="bi bi-plus-circle"></i> Nueva Distribución
+                        </button>
+                    </div>
                 </div>
 
-                <!-- Mensajes -->
+                <!-- Mensajes de alerta -->
                 <?php if (!empty($mensaje)): ?>
-                    <div class="alert alert-<?php echo $tipo_mensaje; ?> alert-dismissible fade show" role="alert">
-                        <pre style="white-space: pre-wrap; margin: 0;"><?php echo htmlspecialchars($mensaje); ?></pre>
-                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    <div class="alert alert-<?php echo $tipo_mensaje; ?> alert-dismissible fade show no-print" role="alert">
+                        <div style="white-space: pre-line; font-family: 'Courier New', monospace;">
+                            <?php echo htmlspecialchars($mensaje); ?>
+                        </div>
+                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
                     </div>
                 <?php endif; ?>
 
                 <!-- Filtros -->
-                <div class="card mb-4">
+                <div class="card mb-4 no-print">
                     <div class="card-body">
                         <form method="GET" class="row g-3">
-                            <div class="col-md-4">
-                                <label for="estado" class="form-label">Estado</label>
-                                <select class="form-select" id="estado" name="estado">
-                                    <option value="activo" <?php echo $estado_filter == 'activo' ? 'selected' : ''; ?>>
-                                        <i class="bi bi-check-circle"></i> Activas
-                                    </option>
-                                    <option value="eliminado" <?php echo $estado_filter == 'eliminado' ? 'selected' : ''; ?>>
-                                        <i class="bi bi-trash"></i> Eliminadas
-                                    </option>
+                            <div class="col-md-6">
+                                <label for="estado" class="form-label">Estado:</label>
+                                <select name="estado" id="estado" class="form-select">
+                                    <option value="activo" <?php echo $estado_filter === 'activo' ? 'selected' : ''; ?>>Activas</option>
+                                    <option value="eliminado" <?php echo $estado_filter === 'eliminado' ? 'selected' : ''; ?>>Eliminadas</option>
                                 </select>
                             </div>
-                            <div class="col-md-8 d-flex align-items-end">
-                                <button type="submit" class="btn btn-outline-primary me-2">
-                                    <i class="bi bi-search"></i> Filtrar
+                            <div class="col-md-6 d-flex align-items-end">
+                                <button type="submit" class="btn btn-outline-primary w-100">
+                                    <i class="bi bi-funnel"></i> Filtrar
                                 </button>
-                                <a href="distribuciones.php" class="btn btn-outline-secondary">
-                                    <i class="bi bi-x-lg"></i> Limpiar
-                                </a>
                             </div>
                         </form>
                     </div>
                 </div>
 
                 <!-- Lista de distribuciones -->
-                <div class="card">
-                    <div class="card-header">
-                        <h5 class="card-title mb-0">
-                            <i class="bi bi-list-ul"></i> Lista de Distribuciones (<?php echo $total_distribuciones; ?> total)
-                        </h5>
-                    </div>
-                    <div class="card-body">
-                        <?php if (count($distribuciones) > 0): ?>
-                            <div class="row">
-                                <?php foreach ($distribuciones as $distribucion): ?>
-                                    <div class="col-md-6 col-lg-4 mb-4">
-                                        <div class="card distribution-card h-100">
-                                            <div class="card-header">
-                                                <div class="d-flex justify-content-between align-items-center">
-                                                    <h6 class="mb-0">
-                                                        <i class="bi bi-calendar-week"></i> 
-                                                        <?php echo ucfirst($distribucion['tipo_distribucion']); ?>
-                                                    </h6>
-                                                    <span class="badge <?php echo $distribucion['estado'] == 'activo' ? 'bg-success' : 'bg-secondary'; ?> distribucion-estado">
-                                                        <?php echo $distribucion['estado'] == 'activo' ? 'Activa' : 'Eliminada'; ?>
-                                                    </span>
-                                                </div>
+                <div class="row">
+                    <?php if (count($distribuciones) > 0): ?>
+                        <?php foreach ($distribuciones as $distribucion): ?>
+                            <div class="col-lg-6 col-xl-4 mb-4">
+                                <div class="card distribution-card card-hover h-100">
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <h6 class="card-title mb-0">
+                                            <i class="bi bi-calendar-range"></i> 
+                                            Distribución #<?php echo $distribucion['id']; ?>
+                                        </h6>
+                                        <span class="badge <?php echo $distribucion['estado'] === 'activo' ? 'bg-success estado-activo' : 'bg-danger estado-eliminado'; ?> badge-custom">
+                                            <?php echo ucfirst($distribucion['estado']); ?>
+                                        </span>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="row mb-3">
+                                            <div class="col-6">
+                                                <small class="text-muted">Inicio:</small><br>
+                                                <strong><?php echo date('d/m/Y', strtotime($distribucion['fecha_inicio'])); ?></strong>
                                             </div>
-                                            <div class="card-body">
-                                                <div class="mb-3">
-                                                    <div class="row">
-                                                        <div class="col-6">
-                                                            <small class="text-muted">Inicio:</small><br>
-                                                            <strong><?php echo date('d/m/Y', strtotime($distribucion['fecha_inicio'])); ?></strong>
-                                                        </div>
-                                                        <div class="col-6">
-                                                            <small class="text-muted">Fin:</small><br>
-                                                            <strong><?php echo date('d/m/Y', strtotime($distribucion['fecha_fin'])); ?></strong>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                
-                                                <div class="row mb-3">
-                                                    <div class="col-6">
-                                                        <div class="text-center">
-                                                            <div class="h5 text-primary mb-0"><?php echo $distribucion['total_tablas'] ?: 0; ?></div>
-                                                            <small class="text-muted">Tablas</small>
-                                                        </div>
-                                                    </div>
-                                                    <div class="col-6">
-                                                        <div class="text-center">
-                                                            <div class="h5 text-success mb-0">$<?php echo number_format($distribucion['total_distribucion'] ?: 0, 2); ?></div>
-                                                            <small class="text-muted">Total</small>
-                                                        </div>
-                                                    </div>
-                                                </div>
-
-                                                <?php 
-                                                $dias_exclusion = json_decode($distribucion['dias_exclusion'], true) ?: [];
-                                                if (!empty($dias_exclusion)): 
-                                                ?>
-                                                    <div class="mb-3">
-                                                        <small class="text-muted">Días excluidos:</small><br>
-                                                        <?php 
-                                                        $dias_nombres = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
-                                                        $excluidos = [];
-                                                        foreach ($dias_exclusion as $dia) {
-                                                            $excluidos[] = $dias_nombres[$dia];
-                                                        }
-                                                        echo '<span class="badge bg-warning text-dark">' . implode(', ', $excluidos) . '</span>';
-                                                        ?>
-                                                    </div>
-                                                <?php endif; ?>
-
-                                                <small class="text-muted">
-                                                    <i class="bi bi-clock"></i> Creada: <?php echo date('d/m/Y H:i', strtotime($distribucion['fecha_creacion'])); ?>
-                                                </small>
-                                            </div>
-                                            <div class="card-footer">
-                                                <div class="btn-group w-100" role="group">
-                                                    <?php if ($distribucion['estado'] == 'activo'): ?>
-                                                        <button type="button" class="btn btn-outline-info btn-sm" 
-                                                                onclick="verTablas(<?php echo $distribucion['id']; ?>)" 
-                                                                title="Ver tablas de distribución">
-                                                            <i class="bi bi-table"></i> Ver Tablas
-                                                        </button>
-                                                        <button type="button" class="btn btn-outline-danger btn-sm" 
-                                                                onclick="eliminarDistribucion(<?php echo $distribucion['id']; ?>)" 
-                                                                title="Eliminar distribución">
-                                                            <i class="bi bi-trash"></i>
-                                                        </button>
-                                                    <?php else: ?>
-                                                        <button type="button" class="btn btn-outline-secondary btn-sm" disabled>
-                                                            <i class="bi bi-archive"></i> Eliminada
-                                                        </button>
-                                                    <?php endif; ?>
-                                                </div>
+                                            <div class="col-6">
+                                                <small class="text-muted">Fin:</small><br>
+                                                <strong><?php echo date('d/m/Y', strtotime($distribucion['fecha_fin'])); ?></strong>
                                             </div>
                                         </div>
-                                    </div>
-                                <?php endforeach; ?>
-                            </div>
+                                        
+                                        <div class="row mb-3">
+                                            <div class="col-6">
+                                                <small class="text-muted">Tipo:</small><br>
+                                                <span class="badge <?php echo $distribucion['tipo_distribucion'] === 'completo' ? 'bg-info' : 'bg-warning'; ?> badge-custom">
+                                                    <?php echo ucfirst($distribucion['tipo_distribucion']); ?>
+                                                </span>
+                                            </div>
+                                            <div class="col-6">
+                                                <small class="text-muted">Tablas:</small><br>
+                                                <strong class="text-primary"><?php echo $distribucion['total_tablas'] ?: 0; ?></strong>
+                                            </div>
+                                        </div>
 
-                            <!-- Paginación -->
-                            <?php if ($total_pages > 1): ?>
-                                <nav aria-label="Navegación de distribuciones">
-                                    <ul class="pagination justify-content-center">
-                                        <li class="page-item <?php echo $page <= 1 ? 'disabled' : ''; ?>">
-                                            <a class="page-link" href="?page=<?php echo $page - 1; ?>&estado=<?php echo urlencode($estado_filter); ?>">Anterior</a>
-                                        </li>
-                                        
-                                        <?php for ($i = max(1, $page - 2); $i <= min($total_pages, $page + 2); $i++): ?>
-                                            <li class="page-item <?php echo $i == $page ? 'active' : ''; ?>">
-                                                <a class="page-link" href="?page=<?php echo $i; ?>&estado=<?php echo urlencode($estado_filter); ?>"><?php echo $i; ?></a>
-                                            </li>
-                                        <?php endfor; ?>
-                                        
-                                        <li class="page-item <?php echo $page >= $total_pages ? 'disabled' : ''; ?>">
-                                            <a class="page-link" href="?page=<?php echo $page + 1; ?>&estado=<?php echo urlencode($estado_filter); ?>">Siguiente</a>
-                                        </li>
-                                    </ul>
-                                </nav>
-                            <?php endif; ?>
-                        <?php else: ?>
-                            <div class="text-center py-5">
-                                <i class="bi bi-calendar-x display-1 text-muted"></i>
-                                <h4 class="mt-3">No hay distribuciones</h4>
-                                <p class="text-muted">No se encontraron distribuciones con los criterios especificados.</p>
-                                <?php if ($estado_filter == 'activo'): ?>
-                                    <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalDistribucion">
-                                        <i class="bi bi-plus-lg"></i> Crear Primera Distribución
-                                    </button>
-                                <?php endif; ?>
+                                        <?php if ($distribucion['total_distribucion']): ?>
+                                            <div class="alert alert-success py-2 mb-3">
+                                                <small><i class="bi bi-cash-coin"></i> <strong>Total: $<?php echo number_format($distribucion['total_distribucion'], 2); ?></strong></small>
+                                            </div>
+                                        <?php endif; ?>
+
+                                        <?php if (!empty($distribucion['dias_exclusion']) && $distribucion['dias_exclusion'] !== '[]'): ?>
+                                            <div class="mb-2">
+                                                <small class="text-muted">Días excluidos:</small><br>
+                                                <?php
+                                                $dias_nombres = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+                                                $dias_excluidos = json_decode($distribucion['dias_exclusion'], true) ?: [];
+                                                $excluidos = [];
+                                                foreach ($dias_excluidos as $dia) {
+                                                    $excluidos[] = $dias_nombres[(int)$dia];
+                                                }
+                                                echo '<span class="badge bg-secondary badge-custom">' . implode(', ', $excluidos) . '</span>';
+                                                ?>
+                                            </div>
+                                        <?php endif; ?>
+
+                                        <small class="text-muted">
+                                            <i class="bi bi-clock"></i> Creada: <?php echo date('d/m/Y H:i', strtotime($distribucion['fecha_creacion'])); ?>
+                                        </small>
+                                    </div>
+                                    <div class="card-footer">
+                                        <div class="btn-group w-100" role="group">
+                                            <?php if ($distribucion['estado'] == 'activo'): ?>
+                                                <button type="button" class="btn btn-outline-info btn-sm" 
+                                                        onclick="verTablas(<?php echo $distribucion['id']; ?>)" 
+                                                        title="Ver tablas de distribución">
+                                                    <i class="bi bi-table"></i> Ver Tablas
+                                                </button>
+                                                <button type="button" class="btn btn-outline-danger btn-sm" 
+                                                        onclick="eliminarDistribucion(<?php echo $distribucion['id']; ?>)" 
+                                                        title="Eliminar distribución">
+                                                    <i class="bi bi-trash"></i>
+                                                </button>
+                                            <?php else: ?>
+                                                <button type="button" class="btn btn-outline-secondary btn-sm" disabled>
+                                                    <i class="bi bi-archive"></i> Eliminada
+                                                </button>
+                                            <?php endif; ?>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
-                        <?php endif; ?>
-                    </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div class="col-12">
+                            <div class="alert alert-info text-center">
+                                <i class="bi bi-info-circle"></i> 
+                                No hay distribuciones registradas para mostrar.
+                                <br><br>
+                                <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNuevaDistribucion">
+                                    <i class="bi bi-plus-circle"></i> Crear Primera Distribución
+                                </button>
+                            </div>
+                        </div>
+                    <?php endif; ?>
                 </div>
+
+                <!-- Paginación -->
+                <?php if ($total_pages > 1): ?>
+                    <nav aria-label="Navegación de distribuciones" class="no-print">
+                        <ul class="pagination justify-content-center">
+                            <li class="page-item <?php echo $page <= 1 ? 'disabled' : ''; ?>">
+                                <a class="page-link" href="?page=<?php echo max(1, $page - 1); ?>&estado=<?php echo urlencode($estado_filter); ?>">Anterior</a>
+                            </li>
+                            
+                            <?php for ($i = max(1, $page - 2); $i <= min($total_pages, $page + 2); $i++): ?>
+                                <li class="page-item <?php echo $i == $page ? 'active' : ''; ?>">
+                                    <a class="page-link" href="?page=<?php echo $i; ?>&estado=<?php echo urlencode($estado_filter); ?>"><?php echo $i; ?></a>
+                                </li>
+                            <?php endfor; ?>
+                            
+                            <li class="page-item <?php echo $page >= $total_pages ? 'disabled' : ''; ?>">
+                                <a class="page-link" href="?page=<?php echo min($total_pages, $page + 1); ?>&estado=<?php echo urlencode($estado_filter); ?>">Siguiente</a>
+                            </li>
+                        </ul>
+                    </nav>
+                <?php endif; ?>
+
             </main>
         </div>
     </div>
-
     <!-- Modal para nueva distribución -->
-    <div class="modal fade" id="modalDistribucion" tabindex="-1" aria-labelledby="modalDistribucionLabel" aria-hidden="true">
-        <div class="modal-dialog modal-xl">
+    <div class="modal fade" id="modalNuevaDistribucion" tabindex="-1" aria-labelledby="modalNuevaDistribucionLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title" id="modalDistribucionLabel">
-                        <i class="bi bi-calendar-plus"></i> Nueva Distribución de Unidades
+                    <h5 class="modal-title" id="modalNuevaDistribucionLabel">
+                        <i class="bi bi-plus-circle"></i> Crear Nueva Distribución
                     </h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
-                <form id="formDistribucion" method="POST">
+                <form method="POST" id="formDistribucion">
+                    <input type="hidden" name="accion" value="generar_distribucion">
                     <div class="modal-body">
-                        <input type="hidden" name="accion" value="crear_distribucion">
-                        
                         <!-- Configuración de fechas -->
-                        <h6><i class="bi bi-calendar-range"></i> Período de Distribución</h6>
-                        <div class="row mb-4">
+                        <div class="row mb-3">
                             <div class="col-md-6">
-                                <label for="fecha_inicio" class="form-label">Fecha de Inicio <span class="text-danger">*</span></label>
+                                <label for="fecha_inicio" class="form-label">Fecha de Inicio:</label>
                                 <input type="date" class="form-control" id="fecha_inicio" name="fecha_inicio" required>
                             </div>
                             <div class="col-md-6">
-                                <label for="fecha_fin" class="form-label">Fecha de Fin <span class="text-danger">*</span></label>
+                                <label for="fecha_fin" class="form-label">Fecha de Fin:</label>
                                 <input type="date" class="form-control" id="fecha_fin" name="fecha_fin" required>
                             </div>
                         </div>
 
-                        <!-- Días de exclusión -->
-                        <div class="mb-4">
-                            <h6><i class="bi bi-calendar-x"></i> Días de la Semana a Excluir (Opcional)</h6>
+                        <!-- Días a excluir -->
+                        <div class="mb-3">
+                            <label class="form-label">Días de la semana a excluir:</label>
                             <div class="row">
                                 <?php 
                                 $dias_semana = [
-                                    0 => 'Domingo', 1 => 'Lunes', 2 => 'Martes', 3 => 'Miércoles', 
-                                    4 => 'Jueves', 5 => 'Viernes', 6 => 'Sábado'
+                                    ['valor' => '0', 'nombre' => 'Domingo'],
+                                    ['valor' => '1', 'nombre' => 'Lunes'],
+                                    ['valor' => '2', 'nombre' => 'Martes'],
+                                    ['valor' => '3', 'nombre' => 'Miércoles'],
+                                    ['valor' => '4', 'nombre' => 'Jueves'],
+                                    ['valor' => '5', 'nombre' => 'Viernes'],
+                                    ['valor' => '6', 'nombre' => 'Sábado']
                                 ];
-                                foreach ($dias_semana as $num => $nombre): 
+                                foreach ($dias_semana as $dia): 
                                 ?>
-                                    <div class="col-md-3 col-6">
+                                    <div class="col-md-4 col-6 mb-2">
                                         <div class="form-check">
                                             <input class="form-check-input" type="checkbox" name="dias_exclusion[]" 
-                                                   value="<?php echo $num; ?>" id="dia<?php echo $num; ?>">
-                                            <label class="form-check-label" for="dia<?php echo $num; ?>">
-                                                <?php echo $nombre; ?>
+                                                   value="<?php echo $dia['valor']; ?>" id="dia_<?php echo $dia['valor']; ?>">
+                                            <label class="form-check-label" for="dia_<?php echo $dia['valor']; ?>">
+                                                <?php echo $dia['nombre']; ?>
                                             </label>
                                         </div>
                                     </div>
                                 <?php endforeach; ?>
                             </div>
-                            <small class="text-muted">
-                                <i class="bi bi-info-circle"></i> Marque los días en los que NO desea generar tablas de distribución.
-                            </small>
-                        </div>
-
-                        <!-- Vista previa de validación -->
-                        <div id="validacion-preview" style="display: none;">
-                            <div id="validacion-content"></div>
                         </div>
 
                         <!-- Tipo de distribución -->
-                        <div class="mb-4">
-                            <h6><i class="bi bi-gear"></i> Tipo de Distribución de Unidades</h6>
+                        <div class="mb-3">
+                            <label class="form-label">Tipo de Distribución:</label>
                             <div class="row">
                                 <div class="col-md-6">
                                     <div class="form-check">
-                                        <input class="form-check-input" type="radio" name="tipo_distribucion" id="completo" value="completo" checked>
-                                        <label class="form-check-label" for="completo">
-                                            <strong>📦 Todas las Unidades</strong><br>
-                                            <small class="text-muted">Distribuir TODAS las unidades disponibles en el inventario</small>
+                                        <input class="form-check-input" type="radio" name="tipo_distribucion" 
+                                               id="tipo_completo" value="completo" checked onchange="toggleProductosSeleccion()">
+                                        <label class="form-check-label" for="tipo_completo">
+                                            <strong>Distribución Completa</strong><br>
+                                            <small class="text-muted">Incluir todos los productos con existencia</small>
                                         </label>
                                     </div>
                                 </div>
                                 <div class="col-md-6">
                                     <div class="form-check">
-                                        <input class="form-check-input" type="radio" name="tipo_distribucion" id="parcial" value="parcial">
-                                        <label class="form-check-label" for="parcial">
-                                            <strong>📋 Unidades Específicas</strong><br>
-                                            <small class="text-muted">Seleccionar productos y cantidades exactas de unidades a distribuir</small>
+                                        <input class="form-check-input" type="radio" name="tipo_distribucion" 
+                                               id="tipo_parcial" value="parcial" onchange="toggleProductosSeleccion()">
+                                        <label class="form-check-label" for="tipo_parcial">
+                                            <strong>Distribución Parcial</strong><br>
+                                            <small class="text-muted">Seleccionar productos específicos</small>
                                         </label>
                                     </div>
                                 </div>
                             </div>
                         </div>
 
-                        <!-- Selección de productos parciales -->
-                        <div id="productos-parciales" style="display: none;">
-                            <h6><i class="bi bi-box-seam"></i> Seleccionar Productos y Cantidades de Unidades</h6>
-                            <div class="alert alert-info">
-                                <i class="bi bi-info-circle"></i> <strong>Importante:</strong> En modo parcial, el algoritmo distribuirá exactamente las UNIDADES especificadas para cada producto.
-                            </div>
-                            <div class="row">
-                                <?php 
-                                $current_proveedor = '';
-                                foreach ($productos_con_existencia as $producto):
-                                    if ($current_proveedor != $producto['proveedor']):
-                                        if ($current_proveedor != '') echo '</div></div>';
-                                        $current_proveedor = $producto['proveedor'];
-                                        echo '<div class="col-12"><h6 class="mt-3 text-primary"><i class="bi bi-building"></i> ' . htmlspecialchars($current_proveedor) . '</h6><div class="row">';
-                                    endif;
-                                ?>
-                                    <div class="col-md-6 mb-2">
-                                        <div class="producto-item">
-                                            <div class="d-flex justify-content-between align-items-center">
-                                                <div>
-                                                    <strong><?php echo htmlspecialchars($producto['descripcion']); ?></strong><br>
-                                                    <small class="text-muted">
-                                                        <i class="bi bi-box"></i> Existencia: <?php echo number_format($producto['existencia']); ?> unidades | 
-                                                        <i class="bi bi-currency-dollar"></i><?php echo number_format($producto['precio_venta'], 2); ?>
-                                                    </small>
+                        <!-- Selección de productos (solo para distribución parcial) -->
+                        <div id="productos_seleccion" style="display: none;">
+                            <label class="form-label">Productos a incluir:</label>
+                            <div class="row mb-3">
+                                <div class="col-12">
+                                    <div style="max-height: 300px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem; padding: 0.5rem;">
+                                        <?php 
+                                        $proveedor_actual = '';
+                                        foreach ($productos_con_existencia as $producto): 
+                                            if ($proveedor_actual !== $producto['proveedor']): 
+                                                if ($proveedor_actual !== '') echo '</div>';
+                                                $proveedor_actual = $producto['proveedor'];
+                                        ?>
+                                            <div class="mb-2">
+                                                <h6 class="text-primary mb-2">
+                                                    <i class="bi bi-building"></i> <?php echo htmlspecialchars($proveedor_actual); ?>
+                                                </h6>
+                                        <?php endif; ?>
+                                                <div class="row producto-row mb-2 p-2 border-bottom">
+                                                    <div class="col-1">
+                                                        <input class="form-check-input producto-checkbox" type="checkbox" 
+                                                               name="productos_seleccionados[]" value="<?php echo $producto['id']; ?>" 
+                                                               id="producto_<?php echo $producto['id']; ?>">
+                                                    </div>
+                                                    <div class="col-7">
+                                                        <label class="form-check-label" for="producto_<?php echo $producto['id']; ?>">
+                                                            <strong><?php echo htmlspecialchars($producto['descripcion']); ?></strong><br>
+                                                            <small class="text-muted">
+                                                                Stock: <?php echo $producto['existencia']; ?> | 
+                                                                Precio: $<?php echo number_format($producto['precio_venta'], 2); ?>
+                                                            </small>
+                                                        </label>
+                                                    </div>
+                                                    <div class="col-4">
+                                                        <input type="number" class="form-control cantidad-parcial" 
+                                                               name="cantidades[<?php echo $producto['id']; ?>]" 
+                                                               min="1" max="<?php echo $producto['existencia']; ?>" 
+                                                               placeholder="Cantidad" disabled>
+                                                    </div>
                                                 </div>
-                                                <div class="text-end">
-                                                    <input type="hidden" name="productos_parciales[]" value="<?php echo $producto['id']; ?>">
-                                                    <label class="form-label text-muted small">Unidades</label>
-                                                    <input type="number" class="form-control form-control-sm cantidad-parcial" 
-                                                           name="cantidades_parciales[]" min="0" max="<?php echo $producto['existencia']; ?>" 
-                                                           value="0" style="width: 100px;" 
-                                                           onchange="actualizarContadorProductosParciales()">
-                                                </div>
-                                            </div>
-                                        </div>
+                                        <?php endforeach; ?>
+                                        <?php if ($proveedor_actual !== '') echo '</div>'; ?>
                                     </div>
-                                <?php 
-                                endforeach;
-                                if ($current_proveedor != '') echo '</div></div>';
-                                ?>
-                            </div>
-                            <div id="resumen-parcial" class="mt-3" style="display: none;">
-                                <div class="alert alert-success">
-                                    <strong>📊 Resumen de Unidades Seleccionadas:</strong> <span id="productos-seleccionados-count">0</span> productos seleccionados, 
-                                    <span id="unidades-seleccionadas-count">0</span> unidades totales
                                 </div>
                             </div>
                         </div>
 
-                        <!-- Información del algoritmo corregido -->
-                        <div class="alert alert-success mt-3">
-                            <h6><i class="bi bi-gear-fill"></i> Algoritmo V3.0 Corregido - Garantías de Unidades:</h6>
-                            <div class="row">
-                                <div class="col-md-6">
-                                    <ul class="mb-0 small">
-                                        <li><strong>Cálculo por UNIDADES:</strong> Cuenta existencias reales</li>
-                                        <li><strong>Distribución equilibrada:</strong> Divide unidades entre días</li>
-                                        <li><strong>Cobertura 100%:</strong> Todos los días tendrán productos</li>
-                                    </ul>
-                                </div>
-                                <div class="col-md-6">
-                                    <ul class="mb-0 small">
-                                        <li><strong>Validación previa:</strong> Verifica suficiencia de unidades</li>
-                                        <li><strong>Sin días vacíos:</strong> Garantiza mínimo 1 tabla por día</li>
-                                        <li><strong>Ejemplo:</strong> 26 unidades en 26 días = 1 unidad/día</li>
-                                    </ul>
-                                </div>
+                        <!-- Predicción y validación -->
+                        <div id="prediccion_distribucion" class="alert alert-info" style="display: none;">
+                            <h6><i class="bi bi-info-circle"></i> Análisis de Factibilidad:</h6>
+                            <div id="contenido_prediccion">
+                                <div class="loading-spinner"></div> Calculando...
                             </div>
                         </div>
                     </div>
@@ -1195,7 +1223,7 @@ $productos_con_existencia = $stmt_productos->fetchAll();
                         <i class="bi bi-x-circle"></i> Cerrar
                     </button>
                     <button type="button" class="btn btn-primary" onclick="imprimirTablas()">
-                        <i class="bi bi-printer"></i> Imprimir
+                        <i class="bi bi-printer"></i> Imprimir Todas las Tablas
                     </button>
                 </div>
             </div>
@@ -1244,536 +1272,437 @@ $productos_con_existencia = $stmt_productos->fetchAll();
     <script>
         // Variables globales para validación
         let validacionTimeout = null;
-        let ultimaValidacion = null;
 
-        // **FUNCIÓN JAVASCRIPT CORREGIDA PARA OBTENER UNIDADES DEL INVENTARIO**
-        function obtenerInfoInventarioSimulada(tipoDistribucion) {
-            if (tipoDistribucion === 'completo') {
-                // Calcular UNIDADES TOTALES del inventario completo
-                const totalUnidades = <?php echo array_sum(array_column($productos_con_existencia, 'existencia')); ?>;
-                const totalProductos = <?php echo count($productos_con_existencia); ?>;
-                
-                return {
-                    totalProductos: totalProductos,
-                    totalUnidades: totalUnidades, // ESTE ES EL VALOR CLAVE - SUMA DE TODAS LAS EXISTENCIAS
-                    productosConExistencia: totalProductos
-                };
-            } else {
-                // Calcular UNIDADES SELECCIONADAS en modo parcial
-                const cantidades = document.querySelectorAll('.cantidad-parcial');
-                let productosSeleccionados = 0;
-                let unidadesTotales = 0;
-                
-                cantidades.forEach(input => {
-                    const cantidad = parseInt(input.value) || 0;
-                    if (cantidad > 0) {
-                        productosSeleccionados++;
-                        unidadesTotales += cantidad; // SUMAR LAS UNIDADES SELECCIONADAS
-                    }
-                });
-                
-                return {
-                    totalProductos: productosSeleccionados,
-                    totalUnidades: unidadesTotales, // TOTAL DE UNIDADES SELECCIONADAS
-                    productosConExistencia: productosSeleccionados
-                };
-            }
-        }
-
-        // **FUNCIÓN DE ANÁLISIS CORREGIDA - BASADA EN UNIDADES**
-        function analizarFactibilidad(diasValidos, inventarioInfo) {
-            const totalDias = diasValidos.length;
-            const { totalProductos, totalUnidades, productosConExistencia } = inventarioInfo;
-            
-            if (totalDias <= 0) {
-                return {
-                    factible: false,
-                    tipo: 'error',
-                    mensaje: '❌ No hay días válidos para la distribución. Verifique las fechas y días de exclusión.'
-                };
-            }
-
-            if (totalUnidades <= 0) {
-                return {
-                    factible: false,
-                    tipo: 'error',
-                    mensaje: '❌ No hay unidades disponibles para distribuir.'
-                };
-            }
-
-            // **CÁLCULO CORREGIDO: UNIDADES POR DÍA**
-            const unidadesPorDia = Math.floor(totalUnidades / totalDias);
-            const minimoTablasPorDia = 10;
-            const maximoTablasPorDia = 40;
-            
-            // Verificar si hay al menos 1 unidad por día
-            if (unidadesPorDia < 1) {
-                return {
-                    factible: false,
-                    tipo: 'error',
-                    mensaje: `❌ UNIDADES INSUFICIENTES:\n• Días a cubrir: ${totalDias}\n• Unidades totales: ${totalUnidades.toLocaleString()}\n• Promedio por día: ${(totalUnidades/totalDias).toFixed(2)} unidades\n\n⚠️ No hay suficientes unidades para cubrir ni 1 unidad por día.\n\n💡 Necesita mínimo ${totalDias} unidades (${totalDias - totalUnidades} unidades faltantes).`
-                };
-            }
-            
-            // Calcular cuántas tablas se pueden generar por día
-            const tablasPosiblesPorDia = Math.min(maximoTablasPorDia, Math.max(1, unidadesPorDia));
-            
-            // Verificar si se puede cumplir el objetivo de 10 tablas por día
-            if (tablasPosiblesPorDia < minimoTablasPorDia) {
-                // Puede distribuir pero con menos de 10 tablas por día
-                return {
-                    factible: true,
-                    tipo: 'advertencia',
-                    mensaje: `⚠️ DISTRIBUCIÓN LIMITADA:\n• Días disponibles: ${totalDias}\n• Unidades totales: ${totalUnidades.toLocaleString()}\n• Unidades por día: ${unidadesPorDia}\n• Máximo ${tablasPosiblesPorDia} tablas por día (menos de 10 ideales)\n\n✅ FACTIBLE CON LIMITACIONES:\n• Se cubrirán TODOS los ${totalDias} días\n• Cada día tendrá ${tablasPosiblesPorDia} tabla(s) con productos\n• Para 10+ tablas/día necesitaría ${(minimoTablasPorDia * totalDias) - totalUnidades} unidades más`
-                };
-            }
-            
-            // Distribución óptima factible
-            const tablasEstimadas = Math.min(maximoTablasPorDia, Math.max(minimoTablasPorDia, tablasPosiblesPorDia));
-            return {
-                factible: true,
-                tipo: 'exito',
-                mensaje: `✅ DISTRIBUCIÓN ÓPTIMA:\n• ${totalDias} días disponibles\n• ${totalUnidades.toLocaleString()} unidades totales\n• ${unidadesPorDia} unidades por día\n• Estimado: ${tablasEstimadas} tablas por día\n• ${totalProductos} productos únicos disponibles\n\n🎯 Cobertura garantizada del 100% con distribución equilibrada.`
-            };
-        }
-
-        // Manejar cambio de tipo de distribución
-        document.querySelectorAll('input[name="tipo_distribucion"]').forEach(radio => {
-            radio.addEventListener('change', function() {
-                const productosParcialesDiv = document.getElementById('productos-parciales');
-                if (this.value === 'parcial') {
-                    productosParcialesDiv.style.display = 'block';
-                    actualizarContadorProductosParciales();
-                } else {
-                    productosParcialesDiv.style.display = 'none';
-                }
-                // Revalidar cuando cambie el tipo
-                validarFactibilidadEnTiempoReal();
-            });
-        });
-
-        // Actualizar contador de productos seleccionados en modo parcial
-        function actualizarContadorProductosParciales() {
-            const cantidades = document.querySelectorAll('.cantidad-parcial');
-            let productosSeleccionados = 0;
-            let unidadesTotales = 0;
-            
-            cantidades.forEach(input => {
-                const cantidad = parseInt(input.value) || 0;
-                if (cantidad > 0) {
-                    productosSeleccionados++;
-                    unidadesTotales += cantidad;
-                }
-            });
-            
-            const resumenDiv = document.getElementById('resumen-parcial');
-            const countProductos = document.getElementById('productos-seleccionados-count');
-            const countUnidades = document.getElementById('unidades-seleccionadas-count');
-            
-            if (productosSeleccionados > 0) {
-                resumenDiv.style.display = 'block';
-                countProductos.textContent = productosSeleccionados;
-                countUnidades.textContent = unidadesTotales.toLocaleString();
-            } else {
-                resumenDiv.style.display = 'none';
-            }
-
-            // Revalidar factibilidad cuando cambian las cantidades parciales
-            validarFactibilidadEnTiempoReal();
-        }
-
-        // **FUNCIÓN DE VALIDACIÓN EN TIEMPO REAL**
-        function validarFactibilidadEnTiempoReal() {
-            const fechaInicio = document.getElementById('fecha_inicio').value;
-            const fechaFin = document.getElementById('fecha_fin').value;
-            const tipoDistribucion = document.querySelector('input[name="tipo_distribucion"]:checked')?.value;
-            
-            if (!fechaInicio || !fechaFin || !tipoDistribucion) {
-                document.getElementById('validacion-preview').style.display = 'none';
-                return;
-            }
-
-            // Debounce para evitar muchas llamadas
-            clearTimeout(validacionTimeout);
-            validacionTimeout = setTimeout(() => {
-                realizarValidacionFactibilidad(fechaInicio, fechaFin, tipoDistribucion);
-            }, 800);
-        }
-
-        // Función para realizar la validación usando JavaScript (simulando el algoritmo PHP)
-        function realizarValidacionFactibilidad(fechaInicio, fechaFin, tipoDistribucion) {
-            const previewDiv = document.getElementById('validacion-preview');
-            const contentDiv = document.getElementById('validacion-content');
-            
-            // Mostrar loading
-            previewDiv.style.display = 'block';
-            previewDiv.className = 'validacion-preview';
-            contentDiv.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm" role="status"></div> Analizando factibilidad de unidades...</div>';
-
-            // Calcular días válidos
-            const diasExcluidos = [];
-            document.querySelectorAll('input[name="dias_exclusion[]"]:checked').forEach(cb => {
-                diasExcluidos.push(parseInt(cb.value));
-            });
-
-            const diasValidos = calcularDiasValidos(fechaInicio, fechaFin, diasExcluidos);
-            
-            // Obtener info del inventario (CORREGIDA)
-            const inventarioInfo = obtenerInfoInventarioSimulada(tipoDistribucion);
-            
-            // Realizar análisis (CORREGIDO)
-            const analisis = analizarFactibilidad(diasValidos, inventarioInfo);
-            
-            // Mostrar resultado
-            mostrarResultadoValidacion(analisis, previewDiv, contentDiv);
-        }
-
-        function calcularDiasValidos(fechaInicio, fechaFin, diasExcluidos) {
-            const inicio = new Date(fechaInicio);
-            const fin = new Date(fechaFin);
-            const diasValidos = [];
-            
-            let fechaActual = new Date(inicio);
-            while (fechaActual <= fin) {
-                const diaSemana = fechaActual.getDay();
-                if (!diasExcluidos.includes(diaSemana)) {
-                    diasValidos.push(new Date(fechaActual));
-                }
-                fechaActual.setDate(fechaActual.getDate() + 1);
-            }
-            
-            return diasValidos;
-        }
-
-        function mostrarResultadoValidacion(analisis, previewDiv, contentDiv) {
-            let claseCSS = 'validacion-preview ';
-            let icono = '';
-            
-            switch (analisis.tipo) {
-                case 'exito':
-                    claseCSS += 'factible';
-                    icono = '✅';
-                    break;
-                case 'advertencia':
-                    claseCSS += 'advertencia';
-                    icono = '⚠️';
-                    break;
-                case 'error':
-                    claseCSS += 'no-factible';
-                    icono = '❌';
-                    break;
-            }
-            
-            previewDiv.className = claseCSS;
-            contentDiv.innerHTML = `
-                <div class="d-flex align-items-start">
-                    <div class="me-3" style="font-size: 1.5em;">${icono}</div>
-                    <div>
-                        <h6>Análisis de Factibilidad de Unidades</h6>
-                        <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">${analisis.mensaje}</pre>
-                    </div>
-                </div>
-            `;
-
-            // Habilitar/deshabilitar botón según factibilidad
-            const btnGenerar = document.getElementById('btnGenerarDistribucion');
-            if (analisis.factible) {
-                btnGenerar.disabled = false;
-                btnGenerar.innerHTML = '<i class="bi bi-rocket"></i> Generar Distribución de Unidades';
-            } else {
-                btnGenerar.disabled = true;
-                btnGenerar.innerHTML = '<i class="bi bi-x-circle"></i> Unidades Insuficientes';
-            }
-        }
-
-        // Eventos para activar validación en tiempo real
-        document.getElementById('fecha_inicio').addEventListener('change', validarFactibilidadEnTiempoReal);
-        document.getElementById('fecha_fin').addEventListener('change', validarFactibilidadEnTiempoReal);
-        document.querySelectorAll('input[name="dias_exclusion[]"]').forEach(cb => {
-            cb.addEventListener('change', validarFactibilidadEnTiempoReal);
-        });
-
-        // Agregar eventos a las cantidades parciales
-        document.querySelectorAll('.cantidad-parcial').forEach(input => {
-            input.addEventListener('input', actualizarContadorProductosParciales);
-        });
-
-        // Validación y envío del formulario
-        document.getElementById('formDistribucion').addEventListener('submit', function(e) {
-            const fechaInicio = new Date(document.getElementById('fecha_inicio').value);
-            const fechaFin = new Date(document.getElementById('fecha_fin').value);
-            const tipoDistribucion = document.querySelector('input[name="tipo_distribucion"]:checked').value;
-            
-            // Validar fechas
-            if (fechaInicio >= fechaFin) {
-                e.preventDefault();
-                alert('❌ Error: La fecha de fin debe ser posterior a la fecha de inicio.');
-                return false;
-            }
-            
-            // Si es distribución parcial, validar que tenga unidades suficientes
-            if (tipoDistribucion === 'parcial') {
-                const cantidades = document.querySelectorAll('input[name="cantidades_parciales[]"]');
-                let hayProductos = false;
-                let totalUnidades = 0;
-                
-                cantidades.forEach(input => {
-                    const cantidad = parseInt(input.value) || 0;
-                    if (cantidad > 0) {
-                        hayProductos = true;
-                        totalUnidades += cantidad;
-                    }
-                });
-                
-                if (!hayProductos) {
-                    e.preventDefault();
-                    alert('❌ Error: Debe seleccionar al menos un producto con cantidad mayor a 0.');
-                    return false;
-                }
-                
-                const diasSeleccionados = calcularDiasSeleccionados();
-                if (totalUnidades < diasSeleccionados) {
-                    if (!confirm(`⚠️ Solo seleccionó ${totalUnidades} unidades para ${diasSeleccionados} días. Esto significa menos de 1 unidad por día. ¿Está seguro que desea continuar?`)) {
-                        e.preventDefault();
-                        return false;
-                    }
-                }
-            }
-            
-            // Verificar si la validación indica que no es factible
-            const btnGenerar = document.getElementById('btnGenerarDistribucion');
-            if (btnGenerar.disabled) {
-                e.preventDefault();
-                alert('❌ No se puede generar la distribución. Revise el análisis de factibilidad y corrija los problemas identificados.');
-                return false;
-            }
-            
-            // Confirmar la acción con información detallada
-            const diasSeleccionados = calcularDiasSeleccionados();
-            const inventarioInfo = obtenerInfoInventarioSimulada(tipoDistribucion);
-            
-            let confirmMsg = '';
-            
-            if (tipoDistribucion === 'completo') {
-                confirmMsg = `🎯 ¿Confirmar distribución de TODAS las unidades del inventario?\n\n` +
-                           `📊 Resumen:\n` +
-                           `• ${inventarioInfo.totalUnidades.toLocaleString()} unidades totales a distribuir\n` +
-                           `• ${diasSeleccionados} días válidos de distribución\n` +
-                           `• Promedio: ${Math.floor(inventarioInfo.totalUnidades / diasSeleccionados)} unidades por día\n` +
-                           `• Cobertura garantizada del 100% de los días\n\n` +
-                           `⚠️ Esta operación NO se puede deshacer.`;
-            } else {
-                confirmMsg = `📋 ¿Confirmar distribución de unidades SELECCIONADAS?\n\n` +
-                           `📊 Resumen:\n` +
-                           `• ${inventarioInfo.totalProductos} productos seleccionados\n` +
-                           `• ${inventarioInfo.totalUnidades.toLocaleString()} unidades totales\n` +
-                           `• ${diasSeleccionados} días válidos\n` +
-                           `• Promedio: ${Math.floor(inventarioInfo.totalUnidades / diasSeleccionados)} unidades por día\n\n` +
-                           `⚠️ Esta operación NO se puede deshacer.`;
-            }
-                
-            if (!confirm(confirmMsg)) {
-                e.preventDefault();
-                return false;
-            }
-            
-            // Mostrar indicador de carga
-            const submitBtn = this.querySelector('button[type="submit"]');
-            const originalText = submitBtn.innerHTML;
-            submitBtn.innerHTML = '<i class="bi bi-hourglass-split"></i> Distribuyendo Unidades...';
-            submitBtn.disabled = true;
-            
-            // Restaurar botón después de 45 segundos por si hay error
-            setTimeout(() => {
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
-            }, 45000);
-        });
-
-        // Función para calcular días seleccionados
-        function calcularDiasSeleccionados() {
-            const fechaInicio = new Date(document.getElementById('fecha_inicio').value);
-            const fechaFin = new Date(document.getElementById('fecha_fin').value);
-            const diasExcluidos = [];
-            
-            // Obtener días excluidos
-            document.querySelectorAll('input[name="dias_exclusion[]"]:checked').forEach(checkbox => {
-                diasExcluidos.push(parseInt(checkbox.value));
-            });
-            
-            let count = 0;
-            let fechaActual = new Date(fechaInicio);
-            
-            while (fechaActual <= fechaFin) {
-                const diaSemana = fechaActual.getDay();
-                if (!diasExcluidos.includes(diaSemana)) {
-                    count++;
-                }
-                fechaActual.setDate(fechaActual.getDate() + 1);
-            }
-            
-            return count;
-        }
-
-        // Ver tablas de distribución
-        function verTablas(distribucionId) {
+        // **Función corregida para cargar tablas con formato optimizado para impresión**
+        async function verTablas(distribucionId) {
             const modal = new bootstrap.Modal(document.getElementById('modalVerTablas'));
             modal.show();
             
-            fetch(`get_tablas_distribucion.php?id=${distribucionId}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        mostrarTablasDistribucion(data);
-                    } else {
-                        document.getElementById('tablasContent').innerHTML = `
-                            <div class="alert alert-danger">
-                                <i class="bi bi-exclamation-triangle"></i> Error al cargar las tablas: ${data.message}
-                            </div>
-                        `;
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
+            try {
+                const response = await fetch(`obtener_tablas_distribucion.php?distribucion_id=${distribucionId}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    mostrarTablasConFormatoImpresion(data.tablas_por_dia);
+                } else {
                     document.getElementById('tablasContent').innerHTML = `
-                        <div class="alert alert-danger">
-                            <i class="bi bi-wifi-off"></i> Error de conexión al cargar las tablas.
+                        <div class="alert alert-warning">
+                            <i class="bi bi-exclamation-triangle"></i> ${data.message || 'No se pudieron cargar las tablas'}
                         </div>
                     `;
-                });
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('tablasContent').innerHTML = `
+                    <div class="alert alert-danger">
+                        <i class="bi bi-exclamation-circle"></i> Error al cargar las tablas: ${error.message}
+                    </div>
+                `;
+            }
         }
 
-        // Función para mostrar las tablas de distribución
-        function mostrarTablasDistribucion(data) {
-            const { distribucion, tablas, total_general } = data;
+        // **Nueva función que prepara el contenido para impresión correcta**
+        function mostrarTablasConFormatoImpresion(tablasPorDia) {
+            let html = '';
             
-            let html = `
-                <div class="card mb-4">
-                    <div class="card-header">
-                        <h6 class="mb-0">
-                            <i class="bi bi-info-circle"></i> Información de la Distribución
-                        </h6>
-                    </div>
-                    <div class="card-body">
-                        <div class="row">
-                            <div class="col-md-4">
-                                <strong>Tipo:</strong> ${distribucion.tipo_distribucion.charAt(0).toUpperCase() + distribucion.tipo_distribucion.slice(1)}<br>
-                                <strong>Período:</strong> ${distribucion.fecha_inicio} al ${distribucion.fecha_fin}
-                            </div>
-                            <div class="col-md-4">
-                                <strong>Total Tablas:</strong> ${tablas.length}<br>
-                                <strong>Total Distribución:</strong> ${total_general.toFixed(2)}
-                            </div>
-                            <div class="col-md-4">
-                                <strong>Estado:</strong> <span class="badge bg-success">Activa</span><br>
-                                <strong>Creada:</strong> ${new Date(distribucion.fecha_creacion).toLocaleString()}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `;
-
-            if (tablas.length > 0) {
-                // Agrupar tablas por fecha
-                const tablasPorFecha = {};
-                tablas.forEach(tabla => {
-                    const fecha = tabla.fecha_tabla;
-                    if (!tablasPorFecha[fecha]) {
-                        tablasPorFecha[fecha] = [];
-                    }
-                    tablasPorFecha[fecha].push(tabla);
-                });
-
-                // Mostrar tablas agrupadas por fecha
-                Object.keys(tablasPorFecha).sort().forEach(fecha => {
-                    const tablasDelDia = tablasPorFecha[fecha];
-                    const totalDia = tablasDelDia.reduce((sum, tabla) => sum + parseFloat(tabla.total_tabla), 0);
-                    
-                    html += `
-                        <div class="card mb-3">
-                            <div class="card-header">
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <h6 class="mb-0">
-                                        <i class="bi bi-calendar-day"></i> ${tablasDelDia[0].dia_semana} ${tablasDelDia[0].fecha_tabla_formato}
-                                    </h6>
-                                    <span class="badge bg-primary">${tablasDelDia.length} tablas - ${totalDia.toFixed(2)}</span>
-                                </div>
-                            </div>
-                            <div class="card-body">
-                                <div class="row">
-                    `;
-                    
-                    tablasDelDia.forEach(tabla => {
-                        html += `
-                            <div class="col-md-6 col-lg-4 mb-3">
-                                <div class="border rounded p-3 h-100">
-                                    <div class="d-flex justify-content-between align-items-center mb-2">
-                                        <h6 class="mb-0">Tabla #${tabla.numero_tabla}</h6>
-                                        <span class="badge bg-success">${parseFloat(tabla.total_tabla).toFixed(2)}</span>
-                                    </div>
-                                    <div class="table-responsive">
-                                        <table class="table table-sm">
-                                            <thead>
-                                                <tr>
-                                                    <th>Producto</th>
-                                                    <th>Cant.</th>
-                                                    <th>Precio</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                        `;
-                        
-                        tabla.detalles.forEach(detalle => {
-                            html += `
-                                <tr>
-                                    <td>
-                                        <small>
-                                            <strong>${detalle.descripcion.substring(0, 30)}${detalle.descripcion.length > 30 ? '...' : ''}</strong><br>
-                                            <span class="text-muted">${detalle.proveedor}</span>
-                                        </small>
-                                    </td>
-                                    <td>${detalle.cantidad}</td>
-                                    <td>${parseFloat(detalle.precio_venta).toFixed(2)}</td>
-                                </tr>
-                            `;
-                        });
-                        
-                        html += `
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    });
-                    
-                    html += `
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                });
-            } else {
-                html += `
+            if (!tablasPorDia || Object.keys(tablasPorDia).length === 0) {
+                html = `
                     <div class="alert alert-info">
                         <i class="bi bi-info-circle"></i> No hay tablas generadas para esta distribución.
                     </div>
                 `;
+            } else {
+                // **Crear encabezado de distribución para impresión**
+                html += `
+                    <div class="print-distribution-header mb-4" style="text-align: center; border-bottom: 2px solid #000; padding-bottom: 10px;">
+                        <h2>TABLAS DE DISTRIBUCIÓN</h2>
+                        <p><strong>Generado:</strong> ${new Date().toLocaleString('es-ES')}</p>
+                        <p><strong>Total de días:</strong> ${Object.keys(tablasPorDia).length}</p>
+                    </div>
+                `;
+                
+                Object.entries(tablasPorDia).forEach(([fecha, datosDia], indexDia) => {
+                    const fechaFormateada = new Date(fecha + 'T00:00:00').toLocaleDateString('es-ES', {
+                        weekday: 'long',
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric'
+                    });
+                    
+                    // **Encabezado del día (optimizado para impresión)**
+                    html += `
+                        <div class="tabla-dia-section ${indexDia > 0 ? 'print-page-break' : ''}">
+                            <div class="tabla-dia-header print-dia-header">
+                                📅 ${fechaFormateada.toUpperCase()}
+                                <div style="float: right;">
+                                    Total del día: ${datosDia.tablasDelDia.length} tabla${datosDia.tablasDelDia.length !== 1 ? 's' : ''}
+                                </div>
+                            </div>
+                            <div class="tablas-del-dia-container">
+                    `;
+                    
+                    if (datosDia.tablasDelDia && datosDia.tablasDelDia.length > 0) {
+                        datosDia.tablasDelDia.forEach((tabla, indexTabla) => {
+                            html += `
+                                <div class="tabla-individual-card print-tabla-individual">
+                                    <div class="tabla-header print-tabla-header">
+                                        <div class="tabla-numero">
+                                            📋 Tabla #${tabla.numero_tabla}
+                                        </div>
+                                        <div class="tabla-total">
+                                            Total: $${parseFloat(tabla.total_tabla).toFixed(2)}
+                                        </div>
+                                    </div>
+                                    <div class="tabla-productos">
+                            `;
+                            
+                            if (tabla.detalles && tabla.detalles.length > 0) {
+                                tabla.detalles.forEach(detalle => {
+                                    html += `
+                                        <div class="producto-item print-producto-row">
+                                            <div>
+                                                <div class="producto-descripcion">${detalle.descripcion}</div>
+                                                <div class="producto-proveedor">${detalle.proveedor}</div>
+                                            </div>
+                                            <div class="producto-cantidad">${detalle.cantidad}</div>
+                                            <div class="producto-precio">$${parseFloat(detalle.precio_venta).toFixed(2)}</div>
+                                        </div>
+                                    `;
+                                });
+                            } else {
+                                html += `
+                                    <div class="producto-item print-producto-row">
+                                        <div class="text-muted">Sin productos asignados</div>
+                                        <div>-</div>
+                                        <div>-</div>
+                                    </div>
+                                `;
+                            }
+                            
+                            html += `
+                                    </div>
+                                    <div class="print-total-tabla" style="background-color: #f8f9fa; padding: 8px; border-top: 1px solid #dee2e6; text-align: right; font-weight: bold;">
+                                        TOTAL: $${parseFloat(tabla.total_tabla).toFixed(2)}
+                                    </div>
+                                </div>
+                            `;
+                        });
+                    } else {
+                        html += `
+                            <div class="alert alert-info m-3">
+                                <i class="bi bi-info-circle"></i> No hay tablas para este día.
+                            </div>
+                        `;
+                    }
+                    
+                    html += `
+                            </div>
+                        </div>
+                    `;
+                });
             }
-
+            
             document.getElementById('tablasContent').innerHTML = html;
         }
 
-        // Eliminar distribución
+        // **Función corregida para impresión - Ahora imprime todo el contenido**
+        function imprimirTablas() {
+            // Crear una nueva ventana para la impresión
+            const printWindow = window.open('', '_blank', 'width=800,height=600');
+            
+            // Obtener todo el contenido del modal
+            const contenidoTablas = document.getElementById('tablasContent').innerHTML;
+            
+            // Crear el HTML completo para impresión
+            const htmlParaImpresion = `
+                <!DOCTYPE html>
+                <html lang="es">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Tablas de Distribución - Impresión</title>
+                    <style>
+                        * {
+                            margin: 0;
+                            padding: 0;
+                            box-sizing: border-box;
+                        }
+                        
+                        body {
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            font-size: 12px;
+                            line-height: 1.4;
+                            color: #333;
+                            background: white;
+                        }
+                        
+                        .print-distribution-header {
+                            text-align: center;
+                            margin-bottom: 30px;
+                            padding-bottom: 15px;
+                            border-bottom: 3px solid #000;
+                        }
+                        
+                        .print-distribution-header h2 {
+                            font-size: 24px;
+                            margin-bottom: 10px;
+                            text-transform: uppercase;
+                            letter-spacing: 2px;
+                        }
+                        
+                        .tabla-dia-section {
+                            margin-bottom: 25px;
+                            page-break-inside: avoid;
+                        }
+                        
+                        .tabla-dia-header,
+                        .print-dia-header {
+                            background-color: #007bff !important;
+                            color: white !important;
+                            padding: 12px;
+                            font-size: 16px;
+                            font-weight: bold;
+                            margin-bottom: 15px;
+                            -webkit-print-color-adjust: exact;
+                            print-color-adjust: exact;
+                        }
+                        
+                        .tabla-individual-card,
+                        .print-tabla-individual {
+                            border: 2px solid #333;
+                            margin-bottom: 20px;
+                            page-break-inside: avoid;
+                        }
+                        
+                        .tabla-header,
+                        .print-tabla-header {
+                            background-color: #f8f9fa !important;
+                            padding: 10px;
+                            border-bottom: 1px solid #333;
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                            font-weight: bold;
+                            -webkit-print-color-adjust: exact;
+                            print-color-adjust: exact;
+                        }
+                        
+                        .tabla-total {
+                            background-color: #28a745 !important;
+                            color: white !important;
+                            padding: 6px 12px;
+                            border-radius: 4px;
+                            font-weight: bold;
+                            -webkit-print-color-adjust: exact;
+                            print-color-adjust: exact;
+                        }
+                        
+                        .producto-item,
+                        .print-producto-row {
+                            padding: 8px 10px;
+                            border-bottom: 1px solid #ddd;
+                            display: grid;
+                            grid-template-columns: 3fr 1fr 1fr;
+                            gap: 15px;
+                            align-items: center;
+                        }
+                        
+                        .producto-item:last-child,
+                        .print-producto-row:last-child {
+                            border-bottom: none;
+                        }
+                        
+                        .producto-descripcion {
+                            font-weight: bold;
+                            margin-bottom: 2px;
+                        }
+                        
+                        .producto-proveedor {
+                            font-size: 10px;
+                            color: #666;
+                            font-style: italic;
+                        }
+                        
+                        .producto-cantidad {
+                            text-align: center;
+                            font-weight: bold;
+                            font-size: 14px;
+                        }
+                        
+                        .producto-precio {
+                            text-align: right;
+                            font-weight: bold;
+                            color: #28a745;
+                        }
+                        
+                        .print-total-tabla {
+                            background-color: #e9ecef !important;
+                            padding: 10px;
+                            border-top: 2px solid #333;
+                            text-align: right;
+                            font-weight: bold;
+                            font-size: 14px;
+                            -webkit-print-color-adjust: exact;
+                            print-color-adjust: exact;
+                        }
+                        
+                        .alert {
+                            padding: 12px;
+                            margin: 15px 0;
+                            border: 1px solid #ddd;
+                            border-radius: 4px;
+                            background-color: #f8f9fa !important;
+                            -webkit-print-color-adjust: exact;
+                            print-color-adjust: exact;
+                        }
+                        
+                        .text-muted {
+                            color: #666 !important;
+                        }
+                        
+                        /* Configuración de página */
+                        @page {
+                            margin: 20mm;
+                            size: A4;
+                        }
+                        
+                        /* Saltos de página */
+                        .print-page-break {
+                            page-break-before: always;
+                        }
+                        
+                        /* Evitar cortes inapropiados */
+                        .tabla-dia-section {
+                            page-break-inside: avoid;
+                        }
+                        
+                        .tabla-individual-card {
+                            page-break-inside: avoid;
+                        }
+                    </style>
+                </head>
+                <body>
+                    ${contenidoTablas}
+                </body>
+                </html>
+            `;
+            
+            // Escribir el contenido en la nueva ventana
+            printWindow.document.write(htmlParaImpresion);
+            printWindow.document.close();
+            
+            // Esperar a que se cargue el contenido y luego imprimir
+            printWindow.onload = function() {
+                setTimeout(() => {
+                    printWindow.print();
+                    // Cerrar la ventana después de imprimir
+                    printWindow.onafterprint = function() {
+                        printWindow.close();
+                    };
+                }, 250);
+            };
+        }
+
+        // **Función auxiliar para eliminar distribución (mantener existente)**
         function eliminarDistribucion(id) {
             document.getElementById('distribucion_id_eliminar').value = id;
             const modal = new bootstrap.Modal(document.getElementById('modalEliminar'));
             modal.show();
         }
 
-        // Imprimir tablas
-        function imprimirTablas() {
-            window.print();
+        // Mostrar/ocultar selección de productos
+        function toggleProductosSeleccion() {
+            const tipoCompleto = document.getElementById('tipo_completo').checked;
+            const productosDiv = document.getElementById('productos_seleccion');
+            
+            if (tipoCompleto) {
+                productosDiv.style.display = 'none';
+                // Desmarcar todos los checkboxes
+                document.querySelectorAll('.producto-checkbox').forEach(cb => {
+                    cb.checked = false;
+                    cb.closest('.producto-row').querySelector('.cantidad-parcial').disabled = true;
+                });
+            } else {
+                productosDiv.style.display = 'block';
+            }
+            
+            // Actualizar predicción
+            validarFactibilidadEnTiempoReal();
+        }
+
+        // Validación en tiempo real
+        function validarFactibilidadEnTiempoReal() {
+            clearTimeout(validacionTimeout);
+            validacionTimeout = setTimeout(() => {
+                realizarValidacionFactibilidad();
+            }, 500);
+        }
+
+        function realizarValidacionFactibilidad() {
+            const fechaInicio = document.getElementById('fecha_inicio').value;
+            const fechaFin = document.getElementById('fecha_fin').value;
+            const diasExcluidos = Array.from(document.querySelectorAll('input[name="dias_exclusion[]"]:checked')).map(cb => parseInt(cb.value));
+            const tipoDistribucion = document.querySelector('input[name="tipo_distribucion"]:checked').value;
+            
+            if (!fechaInicio || !fechaFin) {
+                document.getElementById('prediccion_distribucion').style.display = 'none';
+                return;
+            }
+
+            // Calcular días válidos
+            const fechas = [];
+            const inicio = new Date(fechaInicio);
+            const fin = new Date(fechaFin);
+            
+            for (let d = new Date(inicio); d <= fin; d.setDate(d.getDate() + 1)) {
+                if (!diasExcluidos.includes(d.getDay())) {
+                    fechas.push(new Date(d));
+                }
+            }
+
+            // Calcular productos y unidades
+            let totalUnidades = 0;
+            let totalProductos = 0;
+
+            if (tipoDistribucion === 'completo') {
+                <?php foreach ($productos_con_existencia as $producto): ?>
+                    totalUnidades += <?php echo $producto['existencia']; ?>;
+                    totalProductos++;
+                <?php endforeach; ?>
+            } else {
+                document.querySelectorAll('.producto-checkbox:checked').forEach(cb => {
+                    const cantidadInput = cb.closest('.producto-row').querySelector('.cantidad-parcial');
+                    const cantidad = parseInt(cantidadInput.value) || 0;
+                    totalUnidades += cantidad;
+                    totalProductos++;
+                });
+            }
+
+            // Generar predicción
+            const totalDias = fechas.length;
+            const unidadesPorDia = Math.floor(totalUnidades / totalDias);
+            const tablasPorDiaEstimadas = Math.max(1, Math.min(40, unidadesPorDia));
+
+            let html = `
+                <strong>📊 Análisis Predictivo:</strong><br>
+                • <strong>Días de distribución:</strong> ${totalDias}<br>
+                • <strong>Productos únicos:</strong> ${totalProductos}<br>
+                • <strong>Total unidades:</strong> ${totalUnidades.toLocaleString()}<br>
+                • <strong>Unidades por día:</strong> ~${unidadesPorDia}<br>
+                • <strong>Tablas estimadas por día:</strong> ${tablasPorDiaEstimadas}<br>
+                • <strong>Total tablas estimadas:</strong> ~${(tablasPorDiaEstimadas * totalDias).toLocaleString()}
+            `;
+
+            if (totalUnidades > 0 && totalDias > 0) {
+                html += '<br><br><span class="badge bg-success">✅ Distribución factible</span>';
+                document.getElementById('btnGenerarDistribucion').disabled = false;
+            } else {
+                html += '<br><br><span class="badge bg-danger">❌ Configuración inválida</span>';
+                document.getElementById('btnGenerarDistribucion').disabled = true;
+            }
+
+            document.getElementById('contenido_prediccion').innerHTML = html;
+            document.getElementById('prediccion_distribucion').style.display = 'block';
         }
 
         // Configuración inicial al cargar la página
@@ -1801,6 +1730,17 @@ $productos_con_existencia = $stmt_productos->fetchAll();
             if (fechaFinInput.value < fechaInicio) {
                 fechaFinInput.value = fechaInicio;
             }
+            validarFactibilidadEnTiempoReal();
+        });
+
+        // Actualizar validación cuando cambia fecha fin
+        document.getElementById('fecha_fin').addEventListener('change', function() {
+            validarFactibilidadEnTiempoReal();
+        });
+
+        // Actualizar validación cuando cambian días excluidos
+        document.querySelectorAll('input[name="dias_exclusion[]"]').forEach(checkbox => {
+            checkbox.addEventListener('change', validarFactibilidadEnTiempoReal);
         });
 
         // Mejorar experiencia del usuario con feedback visual en productos parciales
@@ -1818,277 +1758,242 @@ $productos_con_existencia = $stmt_productos->fetchAll();
                     setTimeout(() => this.classList.remove('is-valid'), 1000);
                 }
                 
-                actualizarContadorProductosParciales();
-            });
-
-            // Agregar eventos para validación en tiempo real
-            input.addEventListener('change', function() {
-                setTimeout(() => {
-                    validarFactibilidadEnTiempoReal();
-                }, 100);
+                validarFactibilidadEnTiempoReal();
             });
         });
 
-        // Limpiar formulario al cerrar modal
-        document.getElementById('modalDistribucion').addEventListener('hidden.bs.modal', function () {
+        // Habilitar/deshabilitar campos de cantidad cuando se selecciona producto
+        document.querySelectorAll('.producto-checkbox').forEach(checkbox => {
+            checkbox.addEventListener('change', function() {
+                const cantidadInput = this.closest('.producto-row').querySelector('.cantidad-parcial');
+                
+                if (this.checked) {
+                    cantidadInput.disabled = false;
+                    cantidadInput.required = true;
+                    cantidadInput.focus();
+                    
+                    // Asignar valor por defecto (la mitad del stock disponible, mínimo 1)
+                    const max = parseInt(cantidadInput.max);
+                    cantidadInput.value = Math.max(1, Math.floor(max / 2));
+                } else {
+                    cantidadInput.disabled = true;
+                    cantidadInput.required = false;
+                    cantidadInput.value = '';
+                }
+                
+                validarFactibilidadEnTiempoReal();
+            });
+        });
+
+        // Validación del formulario antes de envío
+        document.getElementById('formDistribucion').addEventListener('submit', function(e) {
+            const tipoDistribucion = document.querySelector('input[name="tipo_distribucion"]:checked').value;
+            
+            if (tipoDistribucion === 'parcial') {
+                const productosSeleccionados = document.querySelectorAll('.producto-checkbox:checked');
+                
+                if (productosSeleccionados.length === 0) {
+                    e.preventDefault();
+                    alert('⚠️ Debe seleccionar al menos un producto para distribución parcial.');
+                    return false;
+                }
+                
+                // Validar que todos los productos seleccionados tengan cantidad válida
+                let hayErrores = false;
+                productosSeleccionados.forEach(checkbox => {
+                    const cantidadInput = checkbox.closest('.producto-row').querySelector('.cantidad-parcial');
+                    const cantidad = parseInt(cantidadInput.value) || 0;
+                    const max = parseInt(cantidadInput.max);
+                    
+                    if (cantidad <= 0 || cantidad > max) {
+                        cantidadInput.classList.add('is-invalid');
+                        hayErrores = true;
+                    }
+                });
+                
+                if (hayErrores) {
+                    e.preventDefault();
+                    alert('⚠️ Verifique que todas las cantidades sean válidas (entre 1 y el stock disponible).');
+                    return false;
+                }
+            }
+            
+            // Confirmar antes de generar
+            const fechaInicio = document.getElementById('fecha_inicio').value;
+            const fechaFin = document.getElementById('fecha_fin').value;
+            
+            if (!confirm(`¿Está seguro que desea generar la distribución desde ${fechaInicio} hasta ${fechaFin}?\n\nEsta acción modificará las existencias de los productos.`)) {
+                e.preventDefault();
+                return false;
+            }
+            
+            // Mostrar indicador de carga
+            const btnSubmit = document.getElementById('btnGenerarDistribucion');
+            const textOriginal = btnSubmit.innerHTML;
+            btnSubmit.innerHTML = '<span class="loading-spinner"></span> Generando...';
+            btnSubmit.disabled = true;
+            
+            // Restaurar botón después de 30 segundos (timeout de seguridad)
+            setTimeout(() => {
+                btnSubmit.innerHTML = textOriginal;
+                btnSubmit.disabled = false;
+            }, 30000);
+        });
+
+        // Función para limpiar formulario
+        function limpiarFormulario() {
             document.getElementById('formDistribucion').reset();
-            document.getElementById('productos-parciales').style.display = 'none';
-            document.getElementById('resumen-parcial').style.display = 'none';
-            document.getElementById('validacion-preview').style.display = 'none';
-            document.getElementById('completo').checked = true;
+            document.getElementById('productos_seleccion').style.display = 'none';
+            document.getElementById('prediccion_distribucion').style.display = 'none';
             
-            // Resetear todas las cantidades parciales a 0
+            // Deshabilitar todos los campos de cantidad
             document.querySelectorAll('.cantidad-parcial').forEach(input => {
-                input.value = 0;
+                input.disabled = true;
+                input.value = '';
+                input.classList.remove('is-valid', 'is-invalid');
             });
             
-            // Restaurar botón de submit
-            const submitBtn = document.querySelector('#formDistribucion button[type="submit"]');
-            submitBtn.innerHTML = '<i class="bi bi-rocket"></i> Generar Distribución de Unidades';
-            submitBtn.disabled = false;
+            // Configurar fechas por defecto
+            const hoy = new Date().toISOString().split('T')[0];
+            document.getElementById('fecha_inicio').value = hoy;
+            document.getElementById('fecha_fin').value = hoy;
+        }
+
+        // Limpiar formulario al abrir modal
+        document.getElementById('modalNuevaDistribucion').addEventListener('show.bs.modal', function() {
+            limpiarFormulario();
+            setTimeout(validarFactibilidadEnTiempoReal, 500);
+        });
+
+        // Función para buscar productos en la lista (funcionalidad adicional)
+        function agregarBuscadorProductos() {
+            const productosDiv = document.getElementById('productos_seleccion');
+            const buscadorHTML = `
+                <div class="mb-3">
+                    <input type="text" class="form-control" id="buscador_productos" 
+                           placeholder="🔍 Buscar productos..." onkeyup="filtrarProductos()">
+                </div>
+            `;
             
-            // Limpiar validación
-            ultimaValidacion = null;
-            clearTimeout(validacionTimeout);
-        });
-
-        // Función para destacar días de la semana con colores
-        function destacarDiasExcluidos() {
-            document.querySelectorAll('input[name="dias_exclusion[]"]').forEach(checkbox => {
-                checkbox.addEventListener('change', function() {
-                    const label = this.nextElementSibling;
-                    if (this.checked) {
-                        label.style.color = '#dc3545';
-                        label.style.fontWeight = 'bold';
-                    } else {
-                        label.style.color = '';
-                        label.style.fontWeight = '';
-                    }
-                });
-            });
+            if (productosDiv && !document.getElementById('buscador_productos')) {
+                productosDiv.insertAdjacentHTML('afterbegin', buscadorHTML);
+            }
         }
 
-        // Inicializar funciones adicionales
-        destacarDiasExcluidos();
-
-        // Validación final antes del envío para asegurar que todo esté correcto
-        window.addEventListener('beforeunload', function() {
-            // Limpiar timeouts pendientes
-            if (validacionTimeout) {
-                clearTimeout(validacionTimeout);
-            }
-        });
-
-        // Función adicional para mostrar información de ayuda
-        function mostrarAyudaUnidades() {
-            alert(`🎯 DISTRIBUCIÓN POR UNIDADES - AYUDA:
-
-📊 Cómo funciona:
-• El sistema cuenta las UNIDADES REALES de existencia
-• NO cuenta productos únicos, sino sus cantidades
-• Ejemplo: 1 producto con 26 unidades = 26 unidades totales
-
-📈 Distribución:
-• Las unidades se dividen entre los días disponibles
-• Cada día tendrá al menos 1 tabla con productos
-• El sistema garantiza que ningún día quede vacío
-
-⚠️ Validaciones:
-• Si hay 26 unidades para 30 días = NO factible
-• Si hay 100 unidades para 26 días = SÍ factible (3-4 unidades por día)
-• El sistema te avisa antes de ejecutar
-
-✅ Garantías:
-• 100% de cobertura de días seleccionados
-• Distribución equilibrada de unidades
-• Alertas tempranas de problemas`);
-        }
-
-        // Agregar estilos adicionales para mejorar la experiencia visual
-        const style = document.createElement('style');
-        style.textContent = `
-            .distribution-card:hover {
-                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            }
-            .cantidad-parcial.is-valid {
-                border-color: #28a745;
-            }
-            .cantidad-parcial.is-invalid {
-                border-color: #dc3545;
-                animation: shake 0.5s;
-            }
-            @keyframes shake {
-                0%, 100% { transform: translateX(0); }
-                25% { transform: translateX(-5px); }
-                75% { transform: translateX(5px); }
-            }
-            .producto-item:hover {
-                background-color: #f8f9fa;
-                border-color: #007bff;
-            }
-            .validacion-preview {
-                animation: fadeIn 0.3s ease-in;
-            }
-            @keyframes fadeIn {
-                from { opacity: 0; transform: translateY(-10px); }
-                to { opacity: 1; transform: translateY(0); }
-            }
-            @media print {
-                .modal-footer, .btn, .no-print {
-                    display: none !important;
-                }
-                .modal-dialog {
-                    max-width: 100% !important;
-                    margin: 0 !important;
-                }
-                .modal-content {
-                    border: none !important;
-                    box-shadow: none !important;
-                }
-            }
-        `;
-        document.head.appendChild(style);
-
-        // Función para búsqueda rápida en productos parciales
-        function agregarBusquedaProductos() {
-            const busquedaInput = document.createElement('input');
-            busquedaInput.type = 'text';
-            busquedaInput.className = 'form-control mb-3';
-            busquedaInput.placeholder = '🔍 Buscar productos...';
-            busquedaInput.addEventListener('input', function() {
-                const termino = this.value.toLowerCase();
-                document.querySelectorAll('.producto-item').forEach(item => {
-                    const texto = item.textContent.toLowerCase();
-                    const contenedor = item.closest('.col-md-6');
-                    if (texto.includes(termino)) {
-                        contenedor.style.display = 'block';
-                    } else {
-                        contenedor.style.display = 'none';
-                    }
-                });
-            });
-
-            // Insertar el campo de búsqueda
-            const productosDiv = document.getElementById('productos-parciales');
-            const alertaInfo = productosDiv.querySelector('.alert-info');
-            alertaInfo.insertAdjacentElement('afterend', busquedaInput);
-        }
-
-        // Agregar funcionalidad de búsqueda cuando se muestre el modal
-        document.getElementById('modalDistribucion').addEventListener('shown.bs.modal', function() {
-            if (!document.querySelector('#productos-parciales input[placeholder*="Buscar"]')) {
-                agregarBusquedaProductos();
-            }
-        });
-
-        // Función para seleccionar/deseleccionar todos los productos de un proveedor
-        function agregarFuncionalidadProveedor() {
-            document.querySelectorAll('h6.text-primary').forEach(header => {
-                if (header.textContent.includes('bi-building')) {
-                    const btnToggle = document.createElement('button');
-                    btnToggle.type = 'button';
-                    btnToggle.className = 'btn btn-outline-primary btn-sm ms-2';
-                    btnToggle.innerHTML = '<i class="bi bi-check-all"></i> Seleccionar Todos';
-                    
-                    btnToggle.addEventListener('click', function() {
-                        const proveedorDiv = header.parentElement;
-                        const inputs = proveedorDiv.querySelectorAll('.cantidad-parcial');
-                        const todosMarcados = Array.from(inputs).every(input => parseInt(input.value) > 0);
-                        
-                        inputs.forEach(input => {
-                            if (todosMarcados) {
-                                input.value = 0;
-                            } else {
-                                const max = parseInt(input.max);
-                                input.value = Math.min(max, 5); // Cantidad por defecto
-                            }
-                        });
-                        
-                        btnToggle.innerHTML = todosMarcados ? 
-                            '<i class="bi bi-check-all"></i> Seleccionar Todos' : 
-                            '<i class="bi bi-x-circle"></i> Deseleccionar Todos';
-                        
-                        actualizarContadorProductosParciales();
-                    });
-                    
-                    header.appendChild(btnToggle);
+        function filtrarProductos() {
+            const termino = document.getElementById('buscador_productos').value.toLowerCase();
+            const filas = document.querySelectorAll('.producto-row');
+            
+            filas.forEach(fila => {
+                const descripcion = fila.querySelector('label').textContent.toLowerCase();
+                if (descripcion.includes(termino)) {
+                    fila.style.display = '';
+                } else {
+                    fila.style.display = 'none';
                 }
             });
         }
 
-        // Inicializar funcionalidades adicionales cuando se abra el modal
-        document.getElementById('modalDistribucion').addEventListener('shown.bs.modal', function() {
-            if (!document.querySelector('.btn-outline-primary[onclick*="Seleccionar"]')) {
-                agregarFuncionalidadProveedor();
+        // Agregar buscador cuando se muestra la sección de productos
+        document.getElementById('tipo_parcial').addEventListener('change', function() {
+            if (this.checked) {
+                setTimeout(agregarBuscadorProductos, 100);
             }
         });
 
-        // Mostrar tooltip de ayuda en validación
+        // Funciones auxiliares para mejorar UX
+        function mostrarTooltip(elemento, mensaje) {
+            elemento.setAttribute('title', mensaje);
+            elemento.setAttribute('data-bs-toggle', 'tooltip');
+            elemento.setAttribute('data-bs-placement', 'top');
+            
+            // Inicializar tooltip de Bootstrap si está disponible
+            if (typeof bootstrap !== 'undefined') {
+                new bootstrap.Tooltip(elemento);
+            }
+        }
+
+        // Añadir tooltips informativos
         document.addEventListener('DOMContentLoaded', function() {
-            // Agregar tooltips a elementos importantes
-            const tooltips = [
-                { selector: '#fecha_inicio', title: 'Fecha en que comenzará la distribución' },
-                { selector: '#fecha_fin', title: 'Fecha en que terminará la distribución' },
-                { selector: '#completo', title: 'Distribuir todas las unidades disponibles en inventario' },
-                { selector: '#parcial', title: 'Seleccionar productos específicos y cantidades exactas' }
-            ];
-
-            tooltips.forEach(({selector, title}) => {
-                const element = document.querySelector(selector);
-                if (element) {
-                    element.setAttribute('data-bs-toggle', 'tooltip');
-                    element.setAttribute('data-bs-placement', 'top');
-                    element.setAttribute('title', title);
-                }
-            });
-
-            // Inicializar tooltips de Bootstrap
-            const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-            tooltipTriggerList.map(function (tooltipTriggerEl) {
-                return new bootstrap.Tooltip(tooltipTriggerEl);
+            // Tooltip para tipo de distribución
+            mostrarTooltip(document.getElementById('tipo_completo'), 
+                'Incluye todos los productos con existencia disponible');
+            mostrarTooltip(document.getElementById('tipo_parcial'), 
+                'Permite seleccionar productos específicos y cantidades');
+            
+            // Tooltip para días de exclusión
+            document.querySelectorAll('input[name="dias_exclusion[]"]').forEach(checkbox => {
+                mostrarTooltip(checkbox, 'Marcar para excluir este día de la distribución');
             });
         });
 
-        // Función para exportar configuración de distribución
+        // Función para exportar configuración (funcionalidad adicional)
         function exportarConfiguracion() {
             const config = {
                 fecha_inicio: document.getElementById('fecha_inicio').value,
                 fecha_fin: document.getElementById('fecha_fin').value,
-                tipo_distribucion: document.querySelector('input[name="tipo_distribucion"]:checked')?.value,
                 dias_exclusion: Array.from(document.querySelectorAll('input[name="dias_exclusion[]"]:checked')).map(cb => cb.value),
-                productos_parciales: []
+                tipo_distribucion: document.querySelector('input[name="tipo_distribucion"]:checked').value,
+                timestamp: new Date().toISOString()
             };
-
+            
             if (config.tipo_distribucion === 'parcial') {
-                const cantidades = document.querySelectorAll('.cantidad-parcial');
-                cantidades.forEach((input, index) => {
-                    const cantidad = parseInt(input.value) || 0;
-                    if (cantidad > 0) {
-                        config.productos_parciales.push({
-                            producto_id: input.closest('.producto-item').querySelector('input[name="productos_parciales[]"]').value,
-                            cantidad: cantidad
-                        });
-                    }
+                config.productos_seleccionados = [];
+                document.querySelectorAll('.producto-checkbox:checked').forEach(cb => {
+                    const cantidadInput = cb.closest('.producto-row').querySelector('.cantidad-parcial');
+                    config.productos_seleccionados.push({
+                        producto_id: cb.value,
+                        cantidad: cantidadInput.value
+                    });
                 });
             }
-
-            const dataStr = JSON.stringify(config, null, 2);
-            const dataBlob = new Blob([dataStr], {type: 'application/json'});
-            const url = URL.createObjectURL(dataBlob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `configuracion_distribucion_${new Date().toISOString().split('T')[0]}.json`;
-            link.click();
-            URL.revokeObjectURL(url);
+            
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(config, null, 2));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href", dataStr);
+            downloadAnchorNode.setAttribute("download", `configuracion_distribucion_${new Date().toISOString().split('T')[0]}.json`);
+            document.body.appendChild(downloadAnchorNode);
+            downloadAnchorNode.click();
+            downloadAnchorNode.remove();
         }
 
-        // Agregar botón de exportar configuración si se necesita
-        // Esto se puede activar agregando un botón en el modal
+        // Estadísticas en tiempo real
+        function actualizarEstadisticas() {
+            const totalProductos = <?php echo count($productos_con_existencia); ?>;
+            const totalExistencias = <?php echo array_sum(array_column($productos_con_existencia, 'existencia')); ?>;
+            const valorTotal = <?php 
+                $valor_total = 0;
+                foreach ($productos_con_existencia as $p) {
+                    $valor_total += $p['existencia'] * $p['precio_venta'];
+                }
+                echo $valor_total;
+            ?>;
+            
+            console.log(`📊 Estadísticas del Inventario:
+            • Total productos: ${totalProductos.toLocaleString()}
+            • Total unidades: ${totalExistencias.toLocaleString()}
+            • Valor estimado: ${valorTotal.toLocaleString()}`);
+        }
 
-        console.log('Sistema de Distribuciones V3.0 - Cargado correctamente');
-        console.log('✅ Algoritmo corregido basado en unidades totales');
-        console.log('✅ Validación en tiempo real implementada');
-        console.log('✅ Interfaz completa con diseño responsivo');
+        // Ejecutar estadísticas al cargar
+        actualizarEstadisticas();
+
+        // Función para debugging (modo desarrollo)
+        function debugDistribucion() {
+            console.log('🔧 Modo Debug Activado');
+            console.log('Productos disponibles:', <?php echo count($productos_con_existencia); ?>);
+            console.log('Formulario:', document.getElementById('formDistribucion'));
+            console.log('Validación activa:', validacionTimeout !== null);
+        }
+
+        // Shortcut para debug (Ctrl+Shift+D)
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.shiftKey && e.key === 'D') {
+                debugDistribucion();
+            }
+        });
+
+        console.log('✅ Sistema de Distribuciones cargado correctamente');
     </script>
 </body>
 </html>
